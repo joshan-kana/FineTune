@@ -7,6 +7,7 @@ import SwiftUI
 @testable import FineTune
 
 @Suite("HUD wave-icon thresholds use displayed-percent semantics")
+@MainActor
 struct HUDThresholdTests {
     @Test("Tahoe icon: 0% → speaker.fill (muted glyph)")
     func tahoeZeroPercent() {

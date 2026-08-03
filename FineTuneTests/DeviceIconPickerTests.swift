@@ -4,6 +4,7 @@ import Testing
 @testable import FineTune
 
 @Suite("DeviceIconPicker highlight rule")
+@MainActor
 struct DeviceIconPickerTests {
 
     @Test("Override symbol is highlighted when set")
@@ -29,6 +30,7 @@ struct DeviceIconPickerTests {
 }
 
 @Suite("DeviceIconPicker suggested composition")
+@MainActor
 struct DeviceIconPickerSuggestedTests {
 
     @Test("Leading symbol comes first and is not duplicated from shared")
