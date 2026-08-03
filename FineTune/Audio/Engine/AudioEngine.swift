@@ -818,6 +818,7 @@ final class AudioEngine {
         var state = appAU[app.persistenceIdentifier] ?? AUChainState()
         state.entries.removeAll { $0.id == entryID }
         commitAppAU(state, for: app)
+        AUPluginWindowManager.shared.closeWindow(for: entryID)
     }
 
     func toggleAUEffect(for app: AudioApp, entryID: UUID, enabled: Bool) {
@@ -932,6 +933,7 @@ final class AudioEngine {
         var state = deviceAU[deviceUID] ?? AUChainState()
         state.entries.removeAll { $0.id == entryID }
         commitDeviceAU(state, for: deviceUID)
+        AUPluginWindowManager.shared.closeWindow(for: entryID)
     }
 
     func toggleDeviceAUEffect(deviceUID: String, entryID: UUID, enabled: Bool) {
