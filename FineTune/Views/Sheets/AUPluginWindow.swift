@@ -8,6 +8,11 @@ import os
 final class AUPluginWindowManager {
     static let shared = AUPluginWindowManager()
 
+    /// Custom Audio Unit editors commonly render at a larger scale than the
+    /// minimum window size. Give them a usable initial canvas while retaining
+    /// the plugin's own fitting size when it needs more room.
+    private static let defaultPluginViewSize = NSSize(width: 800, height: 600)
+
     private var windows: [UUID: NSWindow] = [:]
     private var windowDelegates: [UUID: WindowDelegate] = [:]
     private var saveCallbacks: [UUID: () -> Void] = [:]
@@ -22,11 +27,22 @@ final class AUPluginWindowManager {
             return
         }
 
-        let contentView = forceGeneric ? loadGenericView(for: audioUnit) : (loadCustomView(for: audioUnit) ?? loadGenericView(for: audioUnit))
+        let customView = forceGeneric ? nil : loadCustomView(for: audioUnit)
+        let contentView = customView ?? loadGenericView(for: audioUnit)
 
-        let viewSize = contentView.fittingSize
-        let width = max(viewSize.width, 400)
-        let height = max(viewSize.height, 300)
+        // Some scalable editors (for example Pro-Q) report a small fitting
+        // size even after creating a view at the requested size. Fixed-size
+        // editors instead keep their smaller frame, which should determine
+        // the window size so it does not contain an empty area.
+        let frameSize = contentView.frame.size
+        let viewSize = frameSize.width > 0 && frameSize.height > 0
+            ? frameSize
+            : contentView.fittingSize
+        let minimumViewSize = customView == nil
+            ? Self.defaultPluginViewSize
+            : NSSize(width: 400, height: 300)
+        let width = max(viewSize.width, minimumViewSize.width)
+        let height = max(viewSize.height, minimumViewSize.height)
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -129,7 +145,7 @@ final class AUPluginWindowManager {
         }
 
         let factory = viewClass.init()
-        let size = NSSize(width: 400, height: 300)
+        let size = Self.defaultPluginViewSize
 
         // Call via IMP with correct C types — NSObject.perform() would corrupt
         // the AudioUnit pointer (OpaquePointer, not AnyObject).
