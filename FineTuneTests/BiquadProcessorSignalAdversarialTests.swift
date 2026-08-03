@@ -565,13 +565,8 @@ struct ExtremeAmplitudeTests {
         }
     }
 
-    @Test("Infinity input at frame 0: safety net does NOT catch it (checks isNaN, not isInfinite)")
-    func infinityInputBypassesSafetyNet() {
-        // PRODUCTION FINDING: The NaN safety net checks output[0].isNaN but infinity
-        // passes through biquad as infinity (not NaN). The safety net does not catch
-        // infinite values. Additionally, infinity in delay buffers will produce NaN
-        // on subsequent samples (inf - inf = NaN), but the safety net only checks
-        // output[0] and output[1].
+    @Test("Infinity input is silenced before it can contaminate filter state")
+    func infinityInputTriggersSafetyNet() {
         let processor = EQProcessor(sampleRate: 48000)
         var settings = EQSettings.flat
         settings.bandGains[5] = 6
@@ -591,24 +586,9 @@ struct ExtremeAmplitudeTests {
 
         processor.process(input: input, output: output, frameCount: frameCount)
 
-        // Safety net checks isNaN, not isInfinite — infinity passes through uncaught
-        let firstFrameIsInfOrNaN = output[0].isInfinite || output[0].isNaN
-        #expect(firstFrameIsInfOrNaN,
-                "Infinity input: output[0] should be inf or NaN, got \(output[0])")
-
-        // Check if later frames contain non-finite values (inf → NaN propagation via delay state)
-        var hasNonFiniteAfterFrame0 = false
-        for i in 2..<sampleCount {
-            if !output[i].isFinite { hasNonFiniteAfterFrame0 = true; break }
+        for sampleIndex in 0..<sampleCount {
+            #expect(output[sampleIndex] == 0, "Safety output should be silent at sample \(sampleIndex)")
         }
-        #expect(hasNonFiniteAfterFrame0,
-                "Infinity in delay buffers should propagate non-finite values to later frames")
-
-        // Verify safety net did NOT trigger (output NOT zeroed)
-        // This documents the limitation: safety net misses infinity
-        let outputNotZeroed = output[0] != 0
-        #expect(outputNotZeroed,
-                "Safety net should NOT have triggered (it only checks isNaN, not isInfinite)")
     }
 }
 

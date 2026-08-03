@@ -10,6 +10,10 @@ require_full_xcode
 mkdir_build_dirs
 configuration="${FINETUNE_CONFIGURATION:-Debug}"
 archs="${FINETUNE_ARCHS:-arm64}"
+arch_args=()
+for arch in $archs; do
+    arch_args+=(-arch "$arch")
+done
 log_file="$LOG_ROOT/build-${configuration}-$(date +%Y%m%d-%H%M%S).log"
 result_bundle="$RESULTS_ROOT/build-${configuration}.xcresult"
 rm -rf "$result_bundle"
@@ -17,7 +21,7 @@ info "building FineTune ($configuration, $archs)"
 set +e
 xcodebuild -project "$(project_file)" -scheme "$(scheme_name)" -configuration "$configuration" \
     -derivedDataPath "$DERIVED_DATA" -resultBundlePath "$result_bundle" \
-    -arch "$archs" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+    "${arch_args[@]}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
     build 2>&1 | tee "$log_file"
 status=${PIPESTATUS[0]}
 set -e

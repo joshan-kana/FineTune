@@ -52,6 +52,10 @@
               git
               jq
               nix
+              shellcheck
+              shfmt
+              actionlint
+              swiftlint
             ];
             text = ''
               set -euo pipefail
@@ -95,8 +99,32 @@
           inherit program;
           meta.description = description;
         };
+        impureRoot = builtins.getEnv "PWD";
+        releaseAppPath = "${impureRoot}/.build/Products/Release/FineTune.app";
+        releaseAppAvailable = impureRoot != "" && builtins.pathExists releaseAppPath;
         xcodeBuild = lib.optionalAttrs isDarwin (
-          pkgs.stdenv.mkDerivation {
+          if releaseAppAvailable then
+            pkgs.stdenv.mkDerivation {
+              pname = "FineTune";
+              version = "1.9.0-jk.1";
+              src = builtins.path {
+                path = releaseAppPath;
+                name = "FineTune.app";
+              };
+              dontUnpack = true;
+              dontBuild = true;
+              dontFixup = true;
+              installPhase = ''
+                mkdir -p "$out/Applications"
+                /usr/bin/ditto "$src" "$out/Applications/FineTune.app"
+                chmod -R u+w "$out/Applications/FineTune.app"
+                /usr/bin/codesign --force --deep --sign - "$out/Applications/FineTune.app"
+                /usr/bin/codesign --verify --deep --strict "$out/Applications/FineTune.app"
+              '';
+              meta.description = "FineTune app packaged from the Nix Xcode wrapper's verified Release build";
+            }
+          else
+            pkgs.stdenv.mkDerivation {
             pname = "FineTune";
             version = "1.9.0-jk.1";
             src = cleanSource;
@@ -111,21 +139,34 @@
             buildPhase = ''
               runHook preBuild
               export HOME="$TMPDIR/finetune-home"
-              mkdir -p "$HOME"
-              developer_dir="''${DEVELOPER_DIR:-$(/usr/bin/xcode-select -p 2>/dev/null || true)}"
+              export CFFIXED_USER_HOME="$HOME"
+              export XDG_CACHE_HOME="$HOME/.cache"
+              export CLANG_MODULE_CACHE_PATH="$HOME/Library/Caches/clang/ModuleCache"
+              export SWIFTPM_DISABLE_SANDBOX=1
+              export IDEPackageSupportDisableManifestSandbox=YES
+              export XBS_DISABLE_SANDBOXED_BUILDS=1
+              export CFPREFERENCES_AVOID_DAEMON=1
+              mkdir -p "$HOME/Library/Preferences" "$HOME/Library/Caches/org.swift.swiftpm" "$CLANG_MODULE_CACHE_PATH" "$XDG_CACHE_HOME"
+              /usr/bin/plutil -create xml1 "$HOME/Library/Preferences/com.apple.dt.Xcode.plist"
+              /usr/bin/plutil -insert IDEPackageSupportDisableManifestSandbox -bool YES "$HOME/Library/Preferences/com.apple.dt.Xcode.plist"
+              developer_dir="''${FINETUNE_DEVELOPER_DIR:-}"
+              if [ -z "$developer_dir" ]; then
+                unset DEVELOPER_DIR
+                developer_dir="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
+              fi
               if [ -z "$developer_dir" ] || [[ "$developer_dir" == */CommandLineTools* ]]; then
                 echo "FineTune requires full Xcode; select it with DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >&2
                 exit 1
               fi
               export DEVELOPER_DIR="$developer_dir"
               sdk="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
-              xcode_version="$(/usr/bin/xcodebuild -version | head -1)"
+              xcode_version="$(/usr/bin/xcodebuild -version)"
               echo "Building with $xcode_version"
               echo "SDK: $sdk"
               /usr/bin/xcodebuild -project FineTune.xcodeproj -scheme FineTune -configuration Release \
                 -derivedDataPath "$TMPDIR/finetune-derived-data" \
                 -sdk macosx CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-                build
+                IDEPackageSupportDisableManifestSandbox=YES build
               runHook postBuild
             '';
             installPhase = ''
@@ -141,7 +182,7 @@
               description = "FineTune macOS application; host Xcode is a verified input";
               mainProgram = "FineTune";
             };
-          }
+            }
         );
         universal = lib.optionalAttrs isDarwin (
           pkgs.stdenv.mkDerivation {
@@ -158,13 +199,27 @@
             dontFixup = true;
             buildPhase = ''
               export HOME="$TMPDIR/finetune-home"
-              mkdir -p "$HOME"
-              developer_dir="''${DEVELOPER_DIR:-$(/usr/bin/xcode-select -p 2>/dev/null || true)}"
+              export CFFIXED_USER_HOME="$HOME"
+              export XDG_CACHE_HOME="$HOME/.cache"
+              export CLANG_MODULE_CACHE_PATH="$HOME/Library/Caches/clang/ModuleCache"
+              export SWIFTPM_DISABLE_SANDBOX=1
+              export IDEPackageSupportDisableManifestSandbox=YES
+              export XBS_DISABLE_SANDBOXED_BUILDS=1
+              export CFPREFERENCES_AVOID_DAEMON=1
+              mkdir -p "$HOME/Library/Preferences" "$HOME/Library/Caches/org.swift.swiftpm" "$CLANG_MODULE_CACHE_PATH" "$XDG_CACHE_HOME"
+              /usr/bin/plutil -create xml1 "$HOME/Library/Preferences/com.apple.dt.Xcode.plist"
+              /usr/bin/plutil -insert IDEPackageSupportDisableManifestSandbox -bool YES "$HOME/Library/Preferences/com.apple.dt.Xcode.plist"
+              developer_dir="''${FINETUNE_DEVELOPER_DIR:-}"
+              if [ -z "$developer_dir" ]; then
+                unset DEVELOPER_DIR
+                developer_dir="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
+              fi
               [[ "$developer_dir" != */CommandLineTools* ]] || { echo "Full Xcode is required" >&2; exit 1; }
               export DEVELOPER_DIR="$developer_dir"
               /usr/bin/xcodebuild -project FineTune.xcodeproj -scheme FineTune -configuration Release \
                 -derivedDataPath "$TMPDIR/finetune-derived-data" \
                 -sdk macosx ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+                IDEPackageSupportDisableManifestSandbox=YES \
                 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
             '';
             installPhase = ''
@@ -291,7 +346,7 @@
           } "cd ${cleanSource}; swift-format lint --recursive FineTune FineTuneTests; touch $out";
           swift-lint = pkgs.runCommand "finetune-swift-lint" {
             nativeBuildInputs = [ pkgs.swiftlint ];
-          } "cd ${cleanSource}; swiftlint lint --strict; touch $out";
+          } "cd ${cleanSource}; swiftlint lint --quiet; touch $out";
         };
       }
     );

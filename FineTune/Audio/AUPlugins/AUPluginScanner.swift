@@ -3,6 +3,18 @@ import AudioToolbox
 import Foundation
 import os
 
+private final class AURegistrationObserver: @unchecked Sendable {
+    let token: NSObjectProtocol
+
+    init(token: NSObjectProtocol) {
+        self.token = token
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(token)
+    }
+}
+
 @Observable
 @MainActor
 final class AUPluginScanner {
@@ -11,25 +23,21 @@ final class AUPluginScanner {
     private(set) var hasNewPlugins = false
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AUPluginScanner")
-    private nonisolated(unsafe) var registrationObserver: NSObjectProtocol?
+    private var registrationObserver: AURegistrationObserver?
 
     init() {
         refresh()
-        registrationObserver = NotificationCenter.default.addObserver(
+        let token = NotificationCenter.default.addObserver(
             forName: NSNotification.Name(kAudioComponentRegistrationsChangedNotification as String),
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.refresh()
-            self?.hasNewPlugins = true
+            Task { @MainActor [weak self] in
+                self?.refresh()
+                self?.hasNewPlugins = true
+            }
         }
-    }
-
-    deinit {
-        let observer = registrationObserver
-        if let observer {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        registrationObserver = AURegistrationObserver(token: token)
     }
 
     func refresh() {

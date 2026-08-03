@@ -291,7 +291,7 @@ struct AUEffectHostTests {
 
         // Set cutoff to 200 Hz so it aggressively filters high frequencies
         if let au = host.audioUnit {
-            var cutoff: AudioUnitParameterValue = 200.0
+            let cutoff: AudioUnitParameterValue = 200.0
             AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, cutoff, 0)
         }
 
@@ -486,7 +486,7 @@ struct AUEffectChainTests {
 
         // Set cutoff low
         if let au = chain.hosts.first?.audioUnit {
-            var cutoff: AudioUnitParameterValue = 100.0
+            let cutoff: AudioUnitParameterValue = 100.0
             AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, cutoff, 0)
         }
 
@@ -632,8 +632,8 @@ struct SettingsManagerAUTests {
         let settings = SettingsManager()
         let plugin1 = makePlugin(name: "Plugin1", subType: 1)
         let plugin2 = makePlugin(name: "Plugin2", subType: 2)
-        var entry1 = AUEffectChainEntry(plugin: plugin1)
-        var entry2 = AUEffectChainEntry(plugin: plugin2)
+        let entry1 = AUEffectChainEntry(plugin: plugin1)
+        let entry2 = AUEffectChainEntry(plugin: plugin2)
         settings.setAUEffectChain([entry1, entry2], for: "com.test.app")
 
         settings.disableCrashedAUPlugins([plugin1.id])

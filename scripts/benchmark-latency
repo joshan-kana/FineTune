@@ -5,8 +5,8 @@ if [[ "$(uname -s)" != Darwin ]]; then
     printf '%s\n' 'FineTune latency benchmark requires macOS Core Audio.'
     exit 1
 fi
-printf '%s\n' "sample rate: use the active device's nominal rate"
-printf '%s\n' 'buffer duration: active device buffer size / sample rate'
-printf '%s\n' 'FineTune callback/AU timings: exposed by the diagnostic build'
-printf '%s\n' 'reported plugin latency: exposed per effect in the AU chain UI'
-printf '%s\n' 'end-to-end physical device and HDMI latency are not included'
+script_dir="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+xcrun swift "$script_dir/coreaudio-diagnostics.swift"
+printf '%s\n' 'Figures are Core Audio scheduling floors: buffer + device latency + safety offset.'
+printf '%s\n' 'Audio Unit-reported latency is added dynamically by each selected plug-in.'
+printf '%s\n' 'Acoustic, USB, display, and HDMI transport delay requires loopback hardware to measure.'

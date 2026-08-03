@@ -9,8 +9,12 @@ final class AUPluginWindowManager {
     static let shared = AUPluginWindowManager()
 
     private var windows: [UUID: NSWindow] = [:]
+    private var windowDelegates: [UUID: WindowDelegate] = [:]
     private var saveCallbacks: [UUID: () -> Void] = [:]
-    private let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "AUPluginWindow")
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.joshankana.FineTune",
+        category: "AUPluginWindow"
+    )
 
     func showWindow(for entryID: UUID, audioUnit: AudioUnit, pluginName: String, forceGeneric: Bool = false, onSave: @escaping () -> Void) {
         if let existing = windows[entryID] {
@@ -35,24 +39,26 @@ final class AUPluginWindowManager {
         window.isReleasedWhenClosed = false
         window.center()
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.delegate = WindowDelegate(entryID: entryID, manager: self)
+        let windowDelegate = WindowDelegate(entryID: entryID, manager: self)
+        window.delegate = windowDelegate
         window.orderFrontRegardless()
 
         windows[entryID] = window
+        windowDelegates[entryID] = windowDelegate
         saveCallbacks[entryID] = onSave
         logger.info("Opened AU window for \(pluginName)")
     }
 
     func closeWindow(for entryID: UUID) {
         windows[entryID]?.close()
-        windows.removeValue(forKey: entryID)
     }
 
     func closeAllWindows() {
-        for window in windows.values {
+        for window in Array(windows.values) {
             window.close()
         }
         windows.removeAll()
+        windowDelegates.removeAll()
     }
 
     func saveAllOpenWindows() {
@@ -65,6 +71,7 @@ final class AUPluginWindowManager {
         saveCallbacks[entryID]?()
         saveCallbacks.removeValue(forKey: entryID)
         windows.removeValue(forKey: entryID)
+        windowDelegates.removeValue(forKey: entryID)
     }
 
     // MARK: - View Loading

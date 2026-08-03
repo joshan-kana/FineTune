@@ -17,7 +17,6 @@ Makefile
 xcodemake*.log
 
 # Tests
-FineTuneUITests/
 __Snapshots__/
 
 # macOS

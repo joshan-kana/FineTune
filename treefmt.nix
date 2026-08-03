@@ -16,5 +16,6 @@
     "result/**"
     "dist/**"
     "*.xcresult/**"
+    ".envrc"
   ];
 }

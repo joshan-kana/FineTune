@@ -265,8 +265,8 @@ final class AUEffectHost: @unchecked Sendable {
     func loadPreset(_ data: Data) -> Bool {
         guard let au = _audioUnit, let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { return false }
         let cfPlist = plist as CFPropertyList
-        var mutablePlist: CFPropertyList? = cfPlist
-        let err = AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &mutablePlist, UInt32(MemoryLayout<CFPropertyList?>.size))
+        var unmanagedPlist = Unmanaged.passUnretained(cfPlist)
+        let err = AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &unmanagedPlist, UInt32(MemoryLayout<Unmanaged<CFPropertyList>>.size))
         if err != noErr { logger.warning("Failed to load preset: \(err)") }
         queryTailTime()
         queryLatency()
