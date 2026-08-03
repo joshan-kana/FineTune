@@ -25,8 +25,8 @@ import Foundation
 /// CoreAudio's AudioBufferList is a variable-length C struct — this helper
 /// handles the unsafe pointer arithmetic needed to construct one in Swift.
 private final class TestABL {
-    let pointer: UnsafeMutablePointer<AudioBufferList>
-    private var dataPointers: [UnsafeMutablePointer<Float>] = []
+    nonisolated(unsafe) let pointer: UnsafeMutablePointer<AudioBufferList>
+    nonisolated(unsafe) private var dataPointers: [UnsafeMutablePointer<Float>] = []
 
     /// Create a test AudioBufferList.
     /// - Parameter buffers: Array of (channels, frameCount) describing each buffer.
@@ -78,7 +78,7 @@ private final class TestABL {
         return Int(buf.mDataByteSize) / MemoryLayout<Float>.size
     }
 
-    isolated deinit {
+    deinit {
         for p in dataPointers { p.deallocate() }
         pointer.deallocate()
     }
