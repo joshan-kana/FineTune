@@ -7,6 +7,7 @@ import Foundation
 @testable import FineTune
 
 @Suite("HUD slider fraction matches popup slider position for every tier")
+@MainActor
 struct HUDPopupParityTests {
     @Test("Software tier: HUD sliderFraction == DeviceRow.volumeToSlider for the same gain", arguments: [
         Float(0.0), 0.01, 0.1, 0.25, 0.5, 0.7071, 0.9, 1.0
