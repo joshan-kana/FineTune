@@ -40,21 +40,14 @@ final class HUDWindowController: MediaKeyHUDPresenting {
         subscribeToSettingsChangedNotification()
     }
 
-    isolated deinit {
-        if let observer = settingsChangedObserver {
-            DistributedNotificationCenter.default().removeObserver(observer)
-        }
-        // Prefer shutdown() for synchronous teardown during willTerminate; this
-        // deinit safety-net only fires for objects released without that call.
-        if let panel {
-            panel.orderOut(nil)
-        }
-    }
-
     /// Synchronous teardown for `willTerminate` — hides without animation.
     func shutdown() {
         hideTask?.cancel()
         hideTask = nil
+        if let observer = settingsChangedObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+            settingsChangedObserver = nil
+        }
         if let panel, panel.isVisible {
             panel.orderOut(nil)
         }
