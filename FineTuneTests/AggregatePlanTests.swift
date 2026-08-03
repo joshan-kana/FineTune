@@ -125,6 +125,7 @@ struct AggregatePlanTests {
 }
 
 @Suite("ProcessTapController — IO Proc input stream usage")
+@MainActor
 struct InputStreamUsageTests {
 
     @Test("Duplex device (mic + tap): hardware mic stream disabled, tap kept")

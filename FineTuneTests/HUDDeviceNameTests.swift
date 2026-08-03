@@ -20,6 +20,7 @@ struct TahoeStyleHUDNameFontTests {
 }
 
 @Suite("ClassicStyleHUD — no percentage label (AC #18)")
+@MainActor
 struct ClassicStyleHUDStructureTests {
 
     @Test("hasPercentageLabel is false (volumeHUD parity)")
