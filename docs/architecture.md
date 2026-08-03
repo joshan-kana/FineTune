@@ -8,4 +8,4 @@ The callback pipeline is:
 tap → volume/ramp → built-in correction → per-app AU chain → per-device AU chain → loudness/limiter → selected output
 ```
 
-`ProcessTapController` owns primary and crossfade resources. `AUEffectChain` is an immutable snapshot. Main-thread changes construct a replacement chain and defer old-chain destruction so an in-flight callback never observes partially torn-down state.
+`ProcessTapController` owns primary and crossfade resources. `AUEffectChain` is an immutable snapshot. Main-thread changes construct a replacement chain and defer old-chain destruction so an in-flight callback never observes partially torn-down state. Compatible AU host instances are retained by the replacement snapshot, so adding or toggling another effect does not reset a running plugin.

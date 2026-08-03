@@ -311,14 +311,27 @@ final class ProcessTapController: ProcessTapControlling {
     func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {
         _currentAUEntries = entries
         let format = currentAUFormat()
-        let newChain = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: format.sampleRate, format: format)
         let old = auEffectChain
+        let newChain = entries.isEmpty ? nil : AUEffectChain(
+            entries: entries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: old
+        )
+        if old?.isBypassed == true { newChain?.setBypassed(true) }
         auEffectChain = newChain
         updateMaxTailTime()
         if let old { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = old } }
         if secondaryResources.isActive {
             let oldSecondary = secondaryAUEffectChain
-            secondaryAUEffectChain = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: format.sampleRate, format: format)
+            let newSecondary = entries.isEmpty ? nil : AUEffectChain(
+                entries: entries,
+                sampleRate: format.sampleRate,
+                format: format,
+                reusing: oldSecondary
+            )
+            if oldSecondary?.isBypassed == true { newSecondary?.setBypassed(true) }
+            secondaryAUEffectChain = newSecondary
             if let oldSecondary { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldSecondary } }
         }
     }
@@ -339,14 +352,27 @@ final class ProcessTapController: ProcessTapControlling {
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry]) {
         _currentDeviceAUEntries = entries
         let format = currentAUFormat()
-        let newChain = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: format.sampleRate, format: format)
         let old = deviceAUEffectChain
+        let newChain = entries.isEmpty ? nil : AUEffectChain(
+            entries: entries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: old
+        )
+        if old?.isBypassed == true { newChain?.setBypassed(true) }
         deviceAUEffectChain = newChain
         updateMaxTailTime()
         if let old { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = old } }
         if secondaryResources.isActive {
             let oldSecondary = secondaryDeviceAUEffectChain
-            secondaryDeviceAUEffectChain = entries.isEmpty ? nil : AUEffectChain(entries: entries, sampleRate: format.sampleRate, format: format)
+            let newSecondary = entries.isEmpty ? nil : AUEffectChain(
+                entries: entries,
+                sampleRate: format.sampleRate,
+                format: format,
+                reusing: oldSecondary
+            )
+            if oldSecondary?.isBypassed == true { newSecondary?.setBypassed(true) }
+            secondaryDeviceAUEffectChain = newSecondary
             if let oldSecondary { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldSecondary } }
         }
     }

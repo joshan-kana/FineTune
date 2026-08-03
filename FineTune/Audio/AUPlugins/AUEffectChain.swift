@@ -15,6 +15,7 @@ final class AUEffectChain: @unchecked Sendable {
 
     private let _hosts: [AUEffectHost]
     private let hostGroups: [[AUEffectHost]]
+    private let hostGroupsByEntryID: [UUID: [AUEffectHost]]
     private nonisolated(unsafe) var _isBypassed = false
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AUEffectChain")
 
@@ -23,7 +24,13 @@ final class AUEffectChain: @unchecked Sendable {
     var maxTailTime: Double { hostGroups.flatMap { $0 }.filter { $0.isEnabled }.map(\.tailTimeSeconds).max() ?? 0 }
     var aggregateLatencySeconds: Double { hostGroups.flatMap { $0 }.filter { $0.isEnabled }.reduce(0) { $0 + $1.latencySeconds } }
 
-    init(entries: [AUEffectChainEntry], sampleRate: Double, maxFrames: UInt32 = 4096, format: AudioStreamFormatDescription? = nil) {
+    init(
+        entries: [AUEffectChainEntry],
+        sampleRate: Double,
+        maxFrames: UInt32 = 4096,
+        format: AudioStreamFormatDescription? = nil,
+        reusing previousChain: AUEffectChain? = nil
+    ) {
         self.entries = entries
         self.format = format ?? AudioStreamFormatDescription(sampleRate: sampleRate, frameCapacity: maxFrames, channelCount: 2, isInterleaved: false)
 
@@ -33,6 +40,21 @@ final class AUEffectChain: @unchecked Sendable {
         var unsupported = Set<UUID>()
 
         for entry in entries {
+            // Keep an unchanged AU instance alive when a chain snapshot is
+            // replaced. Some third-party AUs (notably editor-heavy effects)
+            // do not reliably resume rendering after being uninitialized and
+            // immediately reinitialized while audio is running.
+            if let reusableGroup = Self.reusableHostGroup(for: entry, in: previousChain, format: self.format),
+               reusableGroup.first?.format == self.format {
+                for host in reusableGroup { host.setEnabled(entry.isEnabled) }
+                groups.append(reusableGroup)
+                allHosts.append(contentsOf: reusableGroup)
+                if reusableGroup.count == 1, !reusableGroup[0].canProcessCurrentLayout {
+                    unsupported.insert(entry.id)
+                }
+                continue
+            }
+
             let native = AUEffectHost(
                 descriptor: entry.pluginDescriptor,
                 entryID: entry.id,
@@ -99,8 +121,41 @@ final class AUEffectChain: @unchecked Sendable {
         self.unsupportedEntryIDs = unsupported
         self._hosts = allHosts
         self.hostGroups = groups
+        self.hostGroupsByEntryID = Dictionary(
+            zip(entries, groups).map { ($0.0.id, $0.1) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         for host in allHosts { CrashGuard.trackPlugin(host.descriptor.id) }
         logger.info("Created AU chain with \(allHosts.count) host instances for \(self.format.shortLabel)")
+    }
+
+    private static func reusableHostGroup(
+        for entry: AUEffectChainEntry,
+        in previousChain: AUEffectChain?,
+        format: AudioStreamFormatDescription
+    ) -> [AUEffectHost]? {
+        guard let previousChain,
+              let previousIndex = previousChain.entries.firstIndex(where: { $0.id == entry.id }),
+              let previousGroup = previousChain.hostGroupsByEntryID[entry.id],
+              !previousGroup.isEmpty,
+              previousChain.entries[previousIndex].pluginDescriptor == entry.pluginDescriptor,
+              previousChain.entries[previousIndex].processingMode == entry.processingMode,
+              previousChain.entries[previousIndex].channelSelection == entry.channelSelection,
+              previousGroup.allSatisfy({ $0.format == format }) else { return nil }
+
+        // A changed preset is deliberately rebuilt on the main thread so the
+        // new configuration is applied before the instance reaches audio.
+        guard previousChain.entries[previousIndex].presetData == entry.presetData,
+              previousChain.entries[previousIndex].selectedFactoryPresetIndex == entry.selectedFactoryPresetIndex else {
+            return nil
+        }
+
+        let expectsIndependentHosts = entry.processingMode == .independentPerChannel ||
+            (entry.processingMode == .auto && format.channelCount > 2 && previousGroup.count > 1)
+        let hasExpectedShape = expectsIndependentHosts
+            ? previousGroup.count == format.channelCount
+            : previousGroup.count == 1
+        return hasExpectedShape ? previousGroup : nil
     }
 
     func setBypassed(_ bypassed: Bool) { _isBypassed = bypassed }

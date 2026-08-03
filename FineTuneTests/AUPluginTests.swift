@@ -470,6 +470,37 @@ struct AUEffectChainTests {
         #expect(chain.host(for: UUID()) == nil)
     }
 
+    @Test("Compatible hosts survive chain replacement")
+    func reusesCompatibleHosts() {
+        let firstEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let secondEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [firstEntry], sampleRate: 44100)
+        let replacement = AUEffectChain(
+            entries: [firstEntry, secondEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.host(for: firstEntry.id) === original.host(for: firstEntry.id))
+        #expect(replacement.host(for: secondEntry.id) !== original.host(for: firstEntry.id))
+    }
+
+    @Test("Reused host reflects an enabled-state change")
+    func reusesHostForToggle() {
+        let enabledEntry = AUEffectChainEntry(plugin: appleAUDelay(), isEnabled: true)
+        let original = AUEffectChain(entries: [enabledEntry], sampleRate: 44100)
+        var disabledEntry = enabledEntry
+        disabledEntry.isEnabled = false
+        let replacement = AUEffectChain(
+            entries: [disabledEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.host(for: enabledEntry.id) === original.host(for: enabledEntry.id))
+        #expect(replacement.host(for: enabledEntry.id)?.isEnabled == false)
+    }
+
     @Test("processInterleaved routes audio through chain")
     func processInterleavedWorks() {
         let desc = AUPluginDescriptor(
