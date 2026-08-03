@@ -103,7 +103,7 @@ struct FineTuneApp: App {
     }
 
     init() {
-        let isUITesting = ProcessInfo.processInfo.environment["FINETUNE_UI_TESTING"] == "1"
+        let isUITesting = TestModeDetector.isRunning
         // Install crash handler to clean up aggregate devices on abnormal exit
         if !isUITesting {
             CrashGuard.install()
