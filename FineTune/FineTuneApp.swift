@@ -51,7 +51,7 @@ struct FineTuneApp: App {
     @State private var shortcutsRegistry: ShortcutsRegistry
     @State private var resolver: TargetAppResolver
     @StateObject private var updateManager = UpdateManager()
-    @State private var auPluginScanner = AUPluginScanner()
+    @State private var auPluginScanner: AUPluginScanner?
     @State private var showMenuBarExtra = true
 
     /// Snapshot icon computed at launch from the user's chosen style and the current
@@ -103,25 +103,21 @@ struct FineTuneApp: App {
     }
 
     init() {
-        let environment = ProcessInfo.processInfo.environment
-        logger.info(
-            "Startup diagnostics: compileTestHost=\(TestModeDetector.isCompileTimeTestHost, privacy: .public) "
-                + "uiTestingFlag=\(TestModeDetector.isUITesting(in: environment), privacy: .public) "
-                + "xctestClassesLoaded=\(TestModeDetector.xctestClassesLoaded, privacy: .public) "
-                + "xctestBundlesLoaded=\(TestModeDetector.xctestBundlesLoaded, privacy: .public)"
-        )
-        let isUITesting = TestModeDetector.isRunning(in: environment)
+        let isTestHost = FineTuneRuntimeMode.isTestHost
         // Install crash handler to clean up aggregate devices on abnormal exit
-        if !isUITesting {
+        let crashedPlugins: Set<String>
+        if !isTestHost {
             CrashGuard.install()
             // Destroy any orphaned aggregate devices from previous crashes
             OrphanedTapCleanup.destroyOrphanedDevices()
+            // Check for AU plugins that were active during a previous crash
+            let scanner = AUPluginScanner()
+            crashedPlugins = CrashGuard.readAndClearCrashPlugins(knownPluginIDs: scanner.plugins.map(\.id))
+            _auPluginScanner = State(initialValue: scanner)
+        } else {
+            crashedPlugins = []
+            _auPluginScanner = State(initialValue: nil)
         }
-
-        // Check for AU plugins that were active during a previous crash
-        let scanner = AUPluginScanner()
-        let crashedPlugins = CrashGuard.readAndClearCrashPlugins(knownPluginIDs: scanner.plugins.map(\.id))
-        _auPluginScanner = State(initialValue: scanner)
 
         let settings = SettingsManager()
         if !crashedPlugins.isEmpty {
@@ -134,7 +130,7 @@ struct FineTuneApp: App {
             permission: permission,
             settingsManager: settings,
             autoEQProfileManager: profileManager,
-            startMonitorsAutomatically: !isUITesting
+            startMonitorsAutomatically: !isTestHost
         )
         engine.loadAUMetadataFromSettings()
         _audioEngine = State(initialValue: engine)
@@ -195,7 +191,7 @@ struct FineTuneApp: App {
         )
         monitor.iconCoordinator = coordinator
         // Defer start() so NSApplication.shared is fully bootstrapped before we walk NSApp.windows.
-        if !isUITesting {
+        if !isTestHost {
             DispatchQueue.main.async { [coordinator] in coordinator.start() }
         }
         _iconCoordinator = State(initialValue: coordinator)
@@ -228,7 +224,7 @@ struct FineTuneApp: App {
         accessibilityService.onTrustChanged = { [weak monitor] _ in
             monitor?.reconcile()
         }
-        if !isUITesting {
+        if !isTestHost {
             accessibilityService.start()
             monitor.reconcile()
         }
@@ -241,7 +237,7 @@ struct FineTuneApp: App {
         let resolver = TargetAppResolver(
             ownBundleID: Bundle.main.bundleIdentifier ?? "com.finetuneapp.FineTune"
         )
-        if !isUITesting {
+        if !isTestHost {
             resolver.start()
         }
         let registry = ShortcutsRegistry(
@@ -258,7 +254,7 @@ struct FineTuneApp: App {
         // Pass engine to AppDelegate
         _appDelegate.wrappedValue.audioEngine = engine
 
-        if !isUITesting && permission.status == .unknown {
+        if !isTestHost && permission.status == .unknown {
             permission.request()
         }
 
@@ -266,7 +262,7 @@ struct FineTuneApp: App {
         // This ensures proper initialization order: deviceMonitor.start() -> deviceVolumeMonitor.start()
 
         // Set delegate before requesting authorization so willPresent is called
-        if !isUITesting {
+        if !isTestHost {
             UNUserNotificationCenter.current().delegate = _appDelegate.wrappedValue
 
             // Request notification authorization (for device disconnect alerts)
@@ -278,19 +274,21 @@ struct FineTuneApp: App {
             }
         }
 
-        // Flush debounced settings + tear down the CGEventTap before dealloc.
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil,
-            queue: .main
-        ) { [settings, engine, monitor, accessibilityService, hud, coordinator] _ in
-            MainActor.assumeIsolated {
-                engine.saveAllLiveAUState()
-                coordinator.stop()
-                monitor.stop()
-                accessibilityService.stop()
-                hud.shutdown()
-                settings.flushSync()
+        if !isTestHost {
+            // Flush debounced settings + tear down the CGEventTap before dealloc.
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [settings, engine, monitor, accessibilityService, hud, coordinator] _ in
+                MainActor.assumeIsolated {
+                    engine.saveAllLiveAUState()
+                    coordinator.stop()
+                    monitor.stop()
+                    accessibilityService.stop()
+                    hud.shutdown()
+                    settings.flushSync()
+                }
             }
         }
     }
