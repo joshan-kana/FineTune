@@ -41,7 +41,9 @@ info "upstream: ${upstream:-missing}"
 }
 [[ "$upstream" == *"ronitsingh10/FineTune"* ]] || {
     warn "upstream is not ronitsingh10/FineTune"
-    blocking=1
+    if [[ "${CI:-}" != "true" ]]; then
+        blocking=1
+    fi
 }
 
 if [[ "$(uname -s)" == Darwin ]]; then
