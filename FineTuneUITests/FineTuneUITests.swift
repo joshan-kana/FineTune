@@ -4,6 +4,7 @@ final class FineTuneUITests: XCTestCase {
     @MainActor
     func testApplicationLaunches() {
         let application = XCUIApplication()
+        application.launchEnvironment["FINETUNE_UI_TESTING"] = "1"
         application.launch()
 
         // FineTune is an accessory/menu-bar application, so XCTest reports it
