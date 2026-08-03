@@ -3,7 +3,7 @@ import Foundation
 import Combine
 import Sparkle
 
-/// Manages app updates via Sparkle
+/// Keeps the fork's in-app update surface disabled; updates use Nix/GitHub.
 @MainActor
 final class UpdateManager: NSObject, ObservableObject {
     private let updaterController: SPUStandardUpdaterController
@@ -19,34 +19,30 @@ final class UpdateManager: NSObject, ObservableObject {
         )
         super.init()
 
-        // Start updater to enable manual checks, but don't trigger auto-check UI
-        try? updaterController.updater.start()
-
-        // Observe when updates can be checked
-        updaterController.updater.publisher(for: \.canCheckForUpdates)
-            .receive(on: DispatchQueue.main)
-            .assign(to: &$canCheckForUpdates)
+        // The upstream appcast is intentionally disabled for this fork. Updates
+        // are delivered through the pinned Nix/GitHub workflow instead.
+        canCheckForUpdates = false
     }
 
     /// Check for updates manually
     func checkForUpdates() {
-        updaterController.checkForUpdates(nil)
+        // Fork builds use `nix run .#update-install`; never consult upstream.
     }
 
     /// Whether automatic update checks are enabled
     var automaticallyChecksForUpdates: Bool {
-        get { updaterController.updater.automaticallyChecksForUpdates }
-        set { updaterController.updater.automaticallyChecksForUpdates = newValue }
+        get { false }
+        set { }
     }
 
     /// Whether to automatically download updates
     var automaticallyDownloadsUpdates: Bool {
-        get { updaterController.updater.automaticallyDownloadsUpdates }
-        set { updaterController.updater.automaticallyDownloadsUpdates = newValue }
+        get { false }
+        set { }
     }
 
     /// Last update check date
     var lastUpdateCheckDate: Date? {
-        updaterController.updater.lastUpdateCheckDate
+        nil
     }
 }

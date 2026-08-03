@@ -46,9 +46,9 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
 
     // MARK: - Pre-allocated Delay Buffers
 
-    private let delayBufferL: UnsafeMutablePointer<Float>
-    private let delayBufferR: UnsafeMutablePointer<Float>
+    private let delayBuffer: UnsafeMutablePointer<Float>
     private let delayBufferSize: Int
+    private let channelCapacity = 8
 
     /// Whether biquad processing is active (RT-safe read).
     var isEnabled: Bool { _isEnabled }
@@ -71,18 +71,15 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
         self._isEnabled = initiallyEnabled
         self.delayBufferSize = (2 * maxSections) + 2
 
-        delayBufferL = .allocate(capacity: delayBufferSize)
-        delayBufferL.initialize(repeating: 0, count: delayBufferSize)
-        delayBufferR = .allocate(capacity: delayBufferSize)
-        delayBufferR.initialize(repeating: 0, count: delayBufferSize)
+        delayBuffer = .allocate(capacity: delayBufferSize * channelCapacity)
+        delayBuffer.initialize(repeating: 0, count: delayBufferSize * channelCapacity)
     }
 
     deinit {
         if let setup = _eqSetup {
             vDSP_biquad_DestroySetup(setup)
         }
-        delayBufferL.deallocate()
-        delayBufferR.deallocate()
+        delayBuffer.deallocate()
     }
 
     // MARK: - Setup Management (main thread)
@@ -111,8 +108,7 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
         _isEnabled = false
         OSMemoryBarrier()
 
-        memset(delayBufferL, 0, delayBufferSize * MemoryLayout<Float>.size)
-        memset(delayBufferR, 0, delayBufferSize * MemoryLayout<Float>.size)
+        memset(delayBuffer, 0, delayBufferSize * channelCapacity * MemoryLayout<Float>.size)
 
         _isEnabled = wasEnabled
         OSMemoryBarrier()
@@ -152,8 +148,7 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
         OSMemoryBarrier()
 
         _eqSetup = newSetup
-        memset(delayBufferL, 0, delayBufferSize * MemoryLayout<Float>.size)
-        memset(delayBufferR, 0, delayBufferSize * MemoryLayout<Float>.size)
+        memset(delayBuffer, 0, delayBufferSize * channelCapacity * MemoryLayout<Float>.size)
 
         _isEnabled = wasEnabled
         OSMemoryBarrier()
@@ -183,7 +178,7 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
     /// Called after input is copied to output, before biquad processing. **Must be RT-safe.**
     ///
     /// Default implementation is a no-op.
-    func preProcess(output: UnsafeMutablePointer<Float>, frameCount: Int) {
+    func preProcess(output: UnsafeMutablePointer<Float>, frameCount: Int, channelCount: Int) {
         // No-op — subclasses override
     }
 
@@ -197,35 +192,54 @@ class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
     ///   - output: Output buffer (stereo interleaved Float32).
     ///   - frameCount: Number of stereo frames (total samples / 2).
     func process(input: UnsafePointer<Float>, output: UnsafeMutablePointer<Float>, frameCount: Int) {
+        process(input: input, output: output, frameCount: frameCount, channelCount: 2, channelOffset: 0)
+    }
+
+    /// Processes an interleaved buffer with any channel count up to the
+    /// supported capacity. Each channel has independent filter state.
+    func process(
+        input: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        channelCount: Int,
+        channelOffset: Int = 0
+    ) {
+        let safeChannels = min(max(1, channelCount), channelCapacity - max(0, channelOffset))
+        guard frameCount > 0, safeChannels > 0 else { return }
         let enabled = _isEnabled
         let setup = _eqSetup
 
         // Bypass: copy input to output
         guard enabled, let setup = setup else {
             if input != UnsafePointer(output) {
-                memcpy(output, input, frameCount * 2 * MemoryLayout<Float>.size)
+                memcpy(output, input, frameCount * safeChannels * MemoryLayout<Float>.size)
             }
             return
         }
 
         // Copy input to output for in-place processing
         if input != UnsafePointer(output) {
-            memcpy(output, input, frameCount * 2 * MemoryLayout<Float>.size)
+            memcpy(output, input, frameCount * safeChannels * MemoryLayout<Float>.size)
         }
 
         // Subclass hook for pre-processing (e.g. preamp gain)
-        preProcess(output: output, frameCount: frameCount)
+        preProcess(output: output, frameCount: frameCount, channelCount: safeChannels)
 
-        // Stereo biquad cascade: stride=2 for interleaved L/R data
-        vDSP_biquad(setup, delayBufferL, output, 2, output, 2, vDSP_Length(frameCount))
-        vDSP_biquad(setup, delayBufferR, output.advanced(by: 1), 2, output.advanced(by: 1), 2, vDSP_Length(frameCount))
+        for channel in 0..<safeChannels {
+            let state = delayBuffer.advanced(by: (channelOffset + channel) * delayBufferSize)
+            let samples = output.advanced(by: channel)
+            vDSP_biquad(setup, state, samples, vDSP_Stride(safeChannels), samples, vDSP_Stride(safeChannels), vDSP_Length(frameCount))
+        }
 
         // NaN safety net — pathological coefficients can produce NaN that
         // propagates through the entire downstream chain
-        if output[0].isNaN || output[1].isNaN {
-            memset(delayBufferL, 0, delayBufferSize * MemoryLayout<Float>.size)
-            memset(delayBufferR, 0, delayBufferSize * MemoryLayout<Float>.size)
-            memset(output, 0, frameCount * 2 * MemoryLayout<Float>.size)
+        var invalid = false
+        for channel in 0..<safeChannels where output[channel].isNaN || output[channel].isInfinite {
+            invalid = true
+        }
+        if invalid {
+            memset(delayBuffer, 0, delayBufferSize * channelCapacity * MemoryLayout<Float>.size)
+            memset(output, 0, frameCount * safeChannels * MemoryLayout<Float>.size)
         }
     }
 }

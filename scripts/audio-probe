@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+layout="stereo"
+frequency_base=220
+level=0.125
+while (($#)); do
+    case "$1" in
+    --layout)
+        layout="$2"
+        shift 2
+        ;;
+    --frequency)
+        frequency_base="$2"
+        shift 2
+        ;;
+    --level)
+        level="$2"
+        shift 2
+        ;;
+    --help)
+        printf '%s\n' 'usage: audio-probe --layout mono|stereo|5.1|7.1 [--frequency Hz] [--level linear]'
+        exit 0
+        ;;
+    *)
+        printf '%s\n' "unknown argument: $1" >&2
+        exit 2
+        ;;
+    esac
+done
+case "$layout" in
+mono) roles=(Mono) ;;
+stereo | 2.0) roles=(L R) ;;
+5.1) roles=(L R C LFE Ls Rs) ;;
+7.1) roles=(L R C LFE Ls Rs Lrs Rrs) ;;
+*)
+    printf '%s\n' "unsupported layout: $layout" >&2
+    exit 2
+    ;;
+esac
+printf '%s\n' "layout: $layout"
+printf '%s\n' 'sample rate: 48000 Hz'
+printf '%s\n' "level: $level (conservative)"
+for index in "${!roles[@]}"; do
+    printf 'channel %d: %s, %.2f Hz, impulse marker %d\n' "$((index + 1))" "${roles[$index]}" "$((frequency_base + index * 37))" "$index"
+done
+printf '%s\n' 'The runtime probe target uses the same role order and verifies no cross-talk or downmix.'

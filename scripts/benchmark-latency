@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' 'FineTune latency benchmark requires macOS Core Audio.'
+    exit 1
+fi
+script_dir="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+xcrun swift "$script_dir/coreaudio-diagnostics.swift"
+printf '%s\n' 'Figures are Core Audio scheduling floors: buffer + device latency + safety offset.'
+printf '%s\n' 'Audio Unit-reported latency is added dynamically by each selected plug-in.'
+printf '%s\n' 'Acoustic, USB, display, and HDMI transport delay requires loopback hardware to measure.'

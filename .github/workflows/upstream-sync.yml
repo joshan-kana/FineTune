@@ -1,0 +1,47 @@
+name: Upstream synchronization
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Merge upstream without touching main
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/ronitsingh10/FineTune.git
+          git fetch upstream main
+          git switch -C automation/upstream-sync origin/main
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort || true
+            summary="upstream=$(git rev-parse upstream/main), fork=$(git rev-parse origin/main)"
+            gh issue list --state open --search '"Upstream sync requires manual resolution" in:title' --json number --jq '.[0].number' | grep -q . || gh issue create --title 'Upstream sync requires manual resolution' --body "$summary"
+            exit 1
+          fi
+          git push --force-with-lease origin HEAD:automation/upstream-sync
+          gh pr create --base main --head automation/upstream-sync --title 'chore: synchronize upstream/main' --body 'Automated upstream synchronization. Attribution and fork-specific changes are preserved for review.' || true
+      - name: Trigger reusable CI explicitly
+        if: steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref automation/upstream-sync

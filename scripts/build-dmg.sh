@@ -15,16 +15,16 @@ mkdir -p "$BUILD_DIR"
 
 echo "==> Building release archive..."
 xcodebuild -project "$PROJECT_DIR/FineTune.xcodeproj" \
-    -scheme FineTune \
-    -configuration Release \
-    -archivePath "$BUILD_DIR/FineTune.xcarchive" \
-    archive
+  -scheme FineTune \
+  -configuration Release \
+  -archivePath "$BUILD_DIR/FineTune.xcarchive" \
+  archive
 
 echo "==> Exporting notarized app..."
 xcodebuild -exportArchive \
-    -archivePath "$BUILD_DIR/FineTune.xcarchive" \
-    -exportPath "$BUILD_DIR" \
-    -exportOptionsPlist "$PROJECT_DIR/ExportOptions.plist"
+  -archivePath "$BUILD_DIR/FineTune.xcarchive" \
+  -exportPath "$BUILD_DIR" \
+  -exportOptionsPlist "$PROJECT_DIR/ExportOptions.plist"
 
 echo "==> Creating DMG..."
 # create-dmg auto-generates professional layout with:

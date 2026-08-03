@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+cd "$REPO_ROOT"
+if command -v shellcheck >/dev/null 2>&1; then
+    find scripts -type f ! -name '*.swift' -print0 | xargs -0 shellcheck -x -e SC1091
+else
+    warn "shellcheck unavailable; use nix develop --command ./scripts/lint"
+fi
+if command -v shfmt >/dev/null 2>&1; then
+    find scripts -type f \( -name '*.sh' -o -name '*.bash' \) -print0 | xargs -0 shfmt -i 2 -d
+    find scripts -type f ! -name '*.swift' ! -name '*.sh' ! -name '*.bash' -print0 | xargs -0 shfmt -d
+else
+    warn "shfmt unavailable; use nix run .#lint inside the dev shell"
+fi
+if command -v actionlint >/dev/null 2>&1; then actionlint .github/workflows/*.yml; else warn "actionlint unavailable"; fi
+if command -v swiftlint >/dev/null 2>&1 && command -v xcodebuild >/dev/null 2>&1 && xcodebuild -version >/dev/null 2>&1; then
+    # Upstream FineTune predates a strict repository-wide SwiftLint baseline;
+    # keep this check advisory while compiler diagnostics remain authoritative.
+    swiftlint lint --quiet
+else
+    warn "swiftlint unavailable or full Xcode is not selected"
+fi
+info "read-only lint completed"

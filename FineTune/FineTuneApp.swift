@@ -51,6 +51,7 @@ struct FineTuneApp: App {
     @State private var shortcutsRegistry: ShortcutsRegistry
     @State private var resolver: TargetAppResolver
     @StateObject private var updateManager = UpdateManager()
+    @State private var auPluginScanner: AUPluginScanner?
     @State private var showMenuBarExtra = true
 
     /// Snapshot icon computed at launch from the user's chosen style and the current
@@ -88,6 +89,7 @@ struct FineTuneApp: App {
             deviceVolumeMonitor: audioEngine.deviceVolumeMonitor as! DeviceVolumeMonitor,
             updateManager: updateManager,
             permission: audioEngine.permission,
+            auPluginScanner: auPluginScanner,
             accessibility: accessibility,
             mediaKeyStatus: mediaKeyStatus,
             popupVisibility: popupVisibility,
@@ -101,15 +103,36 @@ struct FineTuneApp: App {
     }
 
     init() {
+        let isTestHost = FineTuneRuntimeMode.isTestHost
         // Install crash handler to clean up aggregate devices on abnormal exit
-        CrashGuard.install()
-        // Destroy any orphaned aggregate devices from previous crashes
-        OrphanedTapCleanup.destroyOrphanedDevices()
+        let crashedPlugins: Set<String>
+        if !isTestHost {
+            CrashGuard.install()
+            // Destroy any orphaned aggregate devices from previous crashes
+            OrphanedTapCleanup.destroyOrphanedDevices()
+            // Check for AU plugins that were active during a previous crash
+            let scanner = AUPluginScanner()
+            crashedPlugins = CrashGuard.readAndClearCrashPlugins(knownPluginIDs: scanner.plugins.map(\.id))
+            _auPluginScanner = State(initialValue: scanner)
+        } else {
+            crashedPlugins = []
+            _auPluginScanner = State(initialValue: nil)
+        }
 
         let settings = SettingsManager()
+        if !crashedPlugins.isEmpty {
+            settings.markAUPluginsActiveAtCrash(crashedPlugins)
+            settings.disableCrashedAUPlugins(crashedPlugins)
+        }
         let profileManager = AutoEQProfileManager()
         let permission = AudioRecordingPermission()
-        let engine = AudioEngine(permission: permission, settingsManager: settings, autoEQProfileManager: profileManager)
+        let engine = AudioEngine(
+            permission: permission,
+            settingsManager: settings,
+            autoEQProfileManager: profileManager,
+            startMonitorsAutomatically: !isTestHost
+        )
+        engine.loadAUMetadataFromSettings()
         _audioEngine = State(initialValue: engine)
 
         // Media keys / HUD services — instantiated at app scope so the tap
@@ -168,7 +191,9 @@ struct FineTuneApp: App {
         )
         monitor.iconCoordinator = coordinator
         // Defer start() so NSApplication.shared is fully bootstrapped before we walk NSApp.windows.
-        DispatchQueue.main.async { [coordinator] in coordinator.start() }
+        if !isTestHost {
+            DispatchQueue.main.async { [coordinator] in coordinator.start() }
+        }
         _iconCoordinator = State(initialValue: coordinator)
 
         // Render the scene's first frame with the user's chosen style instead of a generic
@@ -199,8 +224,10 @@ struct FineTuneApp: App {
         accessibilityService.onTrustChanged = { [weak monitor] _ in
             monitor?.reconcile()
         }
-        accessibilityService.start()
-        monitor.reconcile()
+        if !isTestHost {
+            accessibilityService.start()
+            monitor.reconcile()
+        }
 
         // Global hotkeys (KeyboardShortcuts SPM, Carbon-backed; no Accessibility
         // permission required for the hotkey itself). Registry start() is deferred
@@ -210,7 +237,9 @@ struct FineTuneApp: App {
         let resolver = TargetAppResolver(
             ownBundleID: Bundle.main.bundleIdentifier ?? "com.finetuneapp.FineTune"
         )
-        resolver.start()
+        if !isTestHost {
+            resolver.start()
+        }
         let registry = ShortcutsRegistry(
             settings: settings,
             popupController: popupController,
@@ -225,7 +254,7 @@ struct FineTuneApp: App {
         // Pass engine to AppDelegate
         _appDelegate.wrappedValue.audioEngine = engine
 
-        if permission.status == .unknown {
+        if !isTestHost && permission.status == .unknown {
             permission.request()
         }
 
@@ -233,28 +262,33 @@ struct FineTuneApp: App {
         // This ensures proper initialization order: deviceMonitor.start() -> deviceVolumeMonitor.start()
 
         // Set delegate before requesting authorization so willPresent is called
-        UNUserNotificationCenter.current().delegate = _appDelegate.wrappedValue
+        if !isTestHost {
+            UNUserNotificationCenter.current().delegate = _appDelegate.wrappedValue
 
-        // Request notification authorization (for device disconnect alerts)
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, error in
-            if let error {
-                logger.error("Notification authorization error: \(error.localizedDescription)")
+            // Request notification authorization (for device disconnect alerts)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, error in
+                if let error {
+                    logger.error("Notification authorization error: \(error.localizedDescription)")
+                }
+                // If not granted, notifications will silently not appear - acceptable behavior
             }
-            // If not granted, notifications will silently not appear - acceptable behavior
         }
 
-        // Flush debounced settings + tear down the CGEventTap before dealloc.
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil,
-            queue: .main
-        ) { [settings, monitor, accessibilityService, hud, coordinator] _ in
-            MainActor.assumeIsolated {
-                coordinator.stop()
-                monitor.stop()
-                accessibilityService.stop()
-                hud.shutdown()
-                settings.flushSync()
+        if !isTestHost {
+            // Flush debounced settings + tear down the CGEventTap before dealloc.
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [settings, engine, monitor, accessibilityService, hud, coordinator] _ in
+                MainActor.assumeIsolated {
+                    engine.saveAllLiveAUState()
+                    coordinator.stop()
+                    monitor.stop()
+                    accessibilityService.stop()
+                    hud.shutdown()
+                    settings.flushSync()
+                }
             }
         }
     }

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+FINETUNE_CONFIGURATION=Debug "$SCRIPT_DIR/build"
+app="$PRODUCTS_ROOT/Debug/FineTune.app"
+if pgrep -x FineTune >/dev/null 2>&1; then
+    warn "FineTune is already running; refusing to launch a second instance"
+    exit 1
+fi
+open "$app"
+info "launched $app"

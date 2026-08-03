@@ -67,9 +67,6 @@ final class ClickOutsideCoordinator {
         }
     }
 
-    isolated deinit {
-        removeMonitors()
-    }
 }
 
 /// Converts a SwiftUI global frame to screen coordinates for hit testing.

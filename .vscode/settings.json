@@ -1,0 +1,16 @@
+{
+  "editor.formatOnSave": false,
+  "[nix]": {
+    "editor.defaultFormatter": "jnoortheen.nix-ide",
+    "editor.formatOnSave": true
+  },
+  "[shellscript]": {
+    "editor.defaultFormatter": "mkhl.shfmt"
+  },
+  "files.exclude": {
+    "**/.build": true,
+    "**/.direnv": true,
+    "**/DerivedData": true,
+    "**/*.xcresult": true
+  }
+}

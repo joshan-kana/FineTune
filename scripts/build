@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/xcode.sh"
+
+ensure_repo
+require_full_xcode
+mkdir_build_dirs
+configuration="${FINETUNE_CONFIGURATION:-Debug}"
+archs="${FINETUNE_ARCHS:-arm64}"
+arch_args=()
+for arch in $archs; do
+    arch_args+=(-arch "$arch")
+done
+log_file="$LOG_ROOT/build-${configuration}-$(date +%Y%m%d-%H%M%S).log"
+result_bundle="$RESULTS_ROOT/build-${configuration}.xcresult"
+rm -rf "$result_bundle"
+info "building FineTune ($configuration, $archs)"
+set +e
+xcodebuild -project "$(project_file)" -scheme "$(scheme_name)" -configuration "$configuration" \
+    -derivedDataPath "$DERIVED_DATA" -resultBundlePath "$result_bundle" \
+    "${arch_args[@]}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+    build 2>&1 | tee "$log_file"
+status=${PIPESTATUS[0]}
+set -e
+if ((status != 0)); then
+    warn "build failed; log preserved at $log_file"
+    exit "$status"
+fi
+mkdir -p "$PRODUCTS_ROOT/$configuration"
+ditto "$DERIVED_DATA/Build/Products/$configuration/FineTune.app" "$PRODUCTS_ROOT/$configuration/FineTune.app"
+codesign --force --deep --sign - "$PRODUCTS_ROOT/$configuration/FineTune.app"
+codesign --verify --deep --strict "$PRODUCTS_ROOT/$configuration/FineTune.app"
+info "built and signed: $PRODUCTS_ROOT/$configuration/FineTune.app"

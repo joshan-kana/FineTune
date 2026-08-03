@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/xcode.sh"
+
+ensure_repo
+blocking=0
+doctor_tmp="$(mktemp -d "${TMPDIR:-/tmp}/finetune-doctor.XXXXXX")"
+trap 'rm -rf "$doctor_tmp"' EXIT
+info "macOS: $(sw_vers -productVersion 2>/dev/null || printf 'not macOS')"
+info "architecture: $(uname -m)"
+if has_command nix; then info "Nix: $(nix --version)"; else
+    warn "Nix is not installed"
+    blocking=1
+fi
+if has_command direnv; then info "direnv: $(direnv version)"; else warn "direnv is not installed"; fi
+if has_command gh; then
+    if gh auth status >/dev/null 2>&1; then
+        info "GitHub authentication: available"
+    else
+        warn "GitHub authentication is unavailable"
+    fi
+else
+    warn "gh is not installed"
+fi
+
+if git -C "$REPO_ROOT" diff --quiet && git -C "$REPO_ROOT" diff --cached --quiet; then
+    info "worktree: clean"
+else
+    warn "worktree: has changes"
+fi
+origin="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+upstream="$(git -C "$REPO_ROOT" remote get-url upstream 2>/dev/null || true)"
+info "origin: ${origin:-missing}"
+info "upstream: ${upstream:-missing}"
+[[ "$origin" == *"joshan-kana/FineTune"* ]] || {
+    warn "origin is not joshan-kana/FineTune"
+    blocking=1
+}
+[[ "$upstream" == *"ronitsingh10/FineTune"* ]] || {
+    warn "upstream is not ronitsingh10/FineTune"
+    if [[ "${CI:-}" != "true" ]]; then
+        blocking=1
+    fi
+}
+
+if [[ "$(uname -s)" == Darwin ]]; then
+    if (require_full_xcode) 2>"$doctor_tmp/xcode-error"; then
+        info "Xcode: $(xcodebuild -version | head -1)"
+        info "SDK: $(xcrun --sdk macosx --show-sdk-path)"
+    else
+        warn "$(sed -n '1p' "$doctor_tmp/xcode-error")"
+        blocking=1
+    fi
+else
+    warn "Xcode checks skipped outside macOS"
+fi
+
+if [[ -f "$REPO_ROOT/FineTune.xcodeproj/xcshareddata/xcschemes/FineTune.xcscheme" ]]; then info "shared FineTune scheme: present"; else
+    warn "shared FineTune scheme: missing"
+    blocking=1
+fi
+if [[ -d /Applications/FineTune.app ]]; then
+    info "installed app: /Applications/FineTune.app"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        info "installed bundle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/FineTune.app/Contents/Info.plist 2>/dev/null || printf 'unreadable')"
+        codesign --verify --deep --strict /Applications/FineTune.app 2>/dev/null || warn "installed app signature does not verify"
+    fi
+else
+    info "installed app: none"
+fi
+
+if [[ "$(uname -s)" == Darwin ]]; then
+    info "legacy audio devices: run nix run .#legacy-audio-check for exact Core Audio state"
+fi
+if ((blocking)); then exit 1; fi

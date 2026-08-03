@@ -19,6 +19,7 @@ import Testing
 @testable import FineTune
 
 @Suite("ProcessTapController — Aggregate Planning")
+@MainActor
 struct AggregatePlanTests {
 
     @Test("Single plain device: unchanged, stays stacked")
@@ -125,6 +126,7 @@ struct AggregatePlanTests {
 }
 
 @Suite("ProcessTapController — IO Proc input stream usage")
+@MainActor
 struct InputStreamUsageTests {
 
     @Test("Duplex device (mic + tap): hardware mic stream disabled, tap kept")

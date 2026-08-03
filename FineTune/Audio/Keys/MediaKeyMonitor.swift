@@ -78,18 +78,6 @@ final class MediaKeyMonitor {
         subscribeToWorkspaceLifecycle()
     }
 
-    isolated deinit {
-        // C callback holds an unretained pointer to self; runloop source must not outlive us.
-        if let tap = tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
-        }
-        let nc = NSWorkspace.shared.notificationCenter
-        for observer in workspaceObservers { nc.removeObserver(observer) }
-    }
-
     // MARK: - Lifecycle
 
     /// Idempotent. No-op unless media keys are enabled and Accessibility is trusted.

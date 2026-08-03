@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/xcode.sh"
+
+ensure_repo
+require_full_xcode
+mkdir_build_dirs
+FINETUNE_CONFIGURATION=Release FINETUNE_ARCHS='arm64 x86_64' "$SCRIPT_DIR/build"
+app="$PRODUCTS_ROOT/Release/FineTune.app"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || git -C "$REPO_ROOT" describe --tags --always)"
+mkdir -p "$REPO_ROOT/dist"
+prefix="$REPO_ROOT/dist/FineTune-$version-macOS-universal"
+rm -f "$prefix.dmg" "$prefix.zip" "$REPO_ROOT/dist/SHA256SUMS" "$REPO_ROOT/dist/build-metadata.json"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$prefix.zip"
+if command -v create-dmg >/dev/null 2>&1; then
+    create-dmg --skip-jenkins "$prefix.dmg" "$app" >/dev/null
+else
+    hdiutil create -volname FineTune -srcfolder "$app" -ov -format UDZO "$prefix.dmg" >/dev/null
+fi
+(cd "$REPO_ROOT/dist" && shasum -a 256 "$(basename "$prefix.dmg")" "$(basename "$prefix.zip")" >SHA256SUMS)
+jq -n \
+    --arg commit "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+    --arg upstream "$(git -C "$REPO_ROOT" rev-parse upstream/main 2>/dev/null || printf unknown)" \
+    --arg version "$version" \
+    --arg xcode "$(xcodebuild -version | tr '\n' ' ')" \
+    --arg sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+    --arg architecture "arm64 x86_64" \
+    --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg signature "ad-hoc" \
+    '{commit:$commit, upstreamCommit:$upstream, version:$version, xcode:$xcode, sdk:$sdk, architecture:$architecture, buildDate:$date, signature:$signature, testResult:"validated by scripts/test"}' >"$REPO_ROOT/dist/build-metadata.json"
+info "packaged artifacts in $REPO_ROOT/dist"

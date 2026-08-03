@@ -21,6 +21,10 @@ Control the volume of every app independently, boost quiet ones up to 4x, route 
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+This maintained fork keeps FineTune's per-application volume and routing controls and adds per-app and per-device Audio Unit chains. Mono, stereo, 5.1 LPCM, and 7.1 LPCM layouts are preserved without a BlackHole, Curve, Element, or persistent virtual-output dependency. FineTune follows the physical output selected by macOS.
+
+The fork is updated through Nix and GitHub rather than the upstream Sparkle feed. Local builds are ad-hoc signed and are not notarized. The fork bundle identifier is `com.joshankana.FineTune`, so macOS may request Screen & System Audio Recording permission again.
+
 <p align="center">
   <img src="assets/screenshot-main.png" alt="FineTune popup showing per-app volume control, multi-device output routing with picker popover, AutoEQ headphone correction, and device-level volume sliders" width="700">
 </p>
@@ -98,6 +102,9 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 - **[AutoEQ & Headphone Correction](guide/autoeq.md)** — Apply frequency correction from the [AutoEQ](https://github.com/jaakkopasanen/AutoEq) project, import [EqualizerAPO](https://sourceforge.net/projects/equalizerapo/) profiles, or browse [autoeq.app](https://www.autoeq.app/)
 - **[URL Schemes](guide/url-schemes.md)** — Automate FineTune from Terminal, [Shortcuts](https://support.apple.com/guide/shortcuts-mac), [Raycast](https://raycast.com), or scripts
 - **[Troubleshooting](guide/troubleshooting.md)** — Permission issues, missing apps, audio problems
+- **[Architecture](docs/architecture.md)** — Tap pipeline, AU ordering, and fail-open behavior
+- **[Multichannel processing](docs/multichannel.md)** — Supported LPCM layouts and channel roles
+- **[Nix workflow](docs/nix.md)** — Build, test, package, and install commands
 
 ## Contributing
 
@@ -108,10 +115,16 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 ### Build from Source
 
 ```bash
-git clone https://github.com/ronitsingh10/FineTune.git
+git clone https://github.com/joshan-kana/FineTune.git
 cd FineTune
-open FineTune.xcodeproj
+direnv allow
+nix run .#doctor
+nix run .#check
+nix run .#build
+nix run .#install
 ```
+
+The package workflow is also available with `nix build .#FineTune --impure --option sandbox false`. Full Xcode is required; Command Line Tools alone are not a compatible substitute.
 
 ## Requirements
 

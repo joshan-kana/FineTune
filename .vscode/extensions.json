@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "jnoortheen.nix-ide",
+    "swiftlang.swift-vscode",
+    "tamasfe.even-better-toml",
+    "mkhl.shfmt"
+  ]
+}

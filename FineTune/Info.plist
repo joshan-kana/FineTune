@@ -10,12 +10,6 @@
 	<string>FineTune needs microphone access to capture audio from apps using input-capable devices.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>FineTune uses Bluetooth to connect paired audio devices from the menu bar.</string>
-	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/ronitsingh10/FineTune/main/appcast.xml</string>
-	<key>SUPublicEDKey</key>
-	<string>xExSoQmCLDCez0KyhZ9EM9PdOZFZgyX/+VF+OVrpIlo=</string>
-	<key>SUEnableInstallerLauncherService</key>
-	<true/>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -24,7 +18,7 @@
 				<string>finetune</string>
 			</array>
 			<key>CFBundleURLName</key>
-			<string>com.finetuneapp.FineTune</string>
+			<string>com.joshankana.FineTune</string>
 		</dict>
 	</array>
 </dict>

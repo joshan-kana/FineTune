@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' 'legacy audio cleanup requires macOS Core Audio.'
+    exit 1
+fi
+if [[ "${1:-}" != "--yes" ]]; then
+    printf '%s\n' 'This command only removes the exact FineTune DSP Bus after validation.' >&2
+    printf '%s\n' 'Re-run with --yes after reviewing nix run .#legacy-audio-check.' >&2
+    exit 2
+fi
+helper_tmp="$(mktemp -d "${TMPDIR:-/tmp}/finetune-legacy-audio.XXXXXX")"
+trap 'rm -rf "$helper_tmp"' EXIT
+swiftc "$SCRIPT_DIR/legacy-audio-helper.swift" -o "$helper_tmp/legacy-audio-helper"
+"$helper_tmp/legacy-audio-helper"
+printf '%s\n' 'BlackHole and Kushview Element were left installed; only the exact aggregate name was considered.'

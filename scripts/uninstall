@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+[[ "$(uname -s)" == Darwin ]] || die "uninstall is macOS-only"
+if [[ "${1:-}" != "--yes" ]]; then
+    die "refusing to remove /Applications/FineTune.app without --yes; settings are preserved"
+fi
+if [[ -d /Applications/FineTune.app ]]; then
+    osascript -e 'tell application "FineTune" to quit' >/dev/null 2>&1 || true
+    rm -rf /Applications/FineTune.app
+    info "removed /Applications/FineTune.app; settings and rollback backups were preserved"
+else
+    info "no installed fork app found"
+fi
