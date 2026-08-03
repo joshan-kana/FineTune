@@ -961,10 +961,6 @@ final class ProcessTapController: ProcessTapControlling {
         _invalidating = false
     }
 
-    isolated deinit {
-        invalidate()
-    }
-
     // MARK: - Crossfade Operations
 
     private func performCrossfadeSwitch(to primaryDeviceUID: String, allDeviceUIDs: [String]? = nil) async throws {

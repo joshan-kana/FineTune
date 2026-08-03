@@ -222,16 +222,5 @@ struct PopoverHost<Content: View>: NSViewRepresentable {
             }
         }
 
-        isolated deinit {
-            if let monitor = localEventMonitor {
-                NSEvent.removeMonitor(monitor)
-            }
-            if let monitor = globalEventMonitor {
-                NSEvent.removeMonitor(monitor)
-            }
-            if let observer = appDeactivateObserver {
-                NotificationCenter.default.removeObserver(observer)
-            }
-        }
     }
 }
