@@ -27,6 +27,7 @@ __Snapshots__/
 reference/
 
 # Local dev tooling
+.direnv/
 .mcp.json
 .xcodebuildmcp/
 launch-team.sh
