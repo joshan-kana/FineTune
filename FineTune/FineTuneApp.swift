@@ -103,7 +103,14 @@ struct FineTuneApp: App {
     }
 
     init() {
-        let isUITesting = TestModeDetector.isRunning
+        let environment = ProcessInfo.processInfo.environment
+        logger.info(
+            "Startup diagnostics: compileTestHost=\(TestModeDetector.isCompileTimeTestHost, privacy: .public) "
+                + "uiTestingFlag=\(TestModeDetector.isUITesting(in: environment), privacy: .public) "
+                + "xctestClassesLoaded=\(TestModeDetector.xctestClassesLoaded, privacy: .public) "
+                + "xctestBundlesLoaded=\(TestModeDetector.xctestBundlesLoaded, privacy: .public)"
+        )
+        let isUITesting = TestModeDetector.isRunning(in: environment)
         // Install crash handler to clean up aggregate devices on abnormal exit
         if !isUITesting {
             CrashGuard.install()

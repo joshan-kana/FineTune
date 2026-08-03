@@ -35,6 +35,18 @@ jobs:
         run: nix flake check --impure --option sandbox false --no-build
       - name: Build and test
         run: nix run .#check
+      - name: Collect test-host crash reports
+        if: failure()
+        run: |
+          mkdir -p .build/Diagnostics/CrashReports
+          find "$HOME/Library/Logs/DiagnosticReports" \
+               "/Library/Logs/DiagnosticReports" \
+            -maxdepth 1 \
+            -type f \
+            \( -name 'FineTune*.ips' -o -name 'FineTune*.crash' \) \
+            -mmin -20 \
+            -exec cp -p {} .build/Diagnostics/CrashReports/ \; \
+            2>/dev/null || true
       - name: Package smoke test
         run: nix run .#package
       - name: Upload build diagnostics
@@ -45,6 +57,7 @@ jobs:
           path: |
             .build/Logs
             .build/Results
+            .build/Diagnostics/CrashReports
             dist/build-metadata.json
             dist/SHA256SUMS
           if-no-files-found: ignore
