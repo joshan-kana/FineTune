@@ -1645,23 +1645,23 @@ final class AudioEngine {
             appDeviceRouting[pid] = targetUID
         }
 
-        var tapsToSwitch: [(app: AudioApp, tap: any ProcessTapControlling)] = []
+        var tapsToSwitch: [(pid: pid_t, appName: String, tap: any ProcessTapControlling)] = []
         for app in apps {
             guard followsDefault.contains(app.id), let tap = taps[app.id] else { continue }
-            tapsToSwitch.append((app, tap))
+            tapsToSwitch.append((app.id, app.name, tap))
         }
         guard !tapsToSwitch.isEmpty else { return }
 
         Task {
-            for (app, tap) in tapsToSwitch {
+            for (pid, appName, tap) in tapsToSwitch {
                 do {
                     let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: true)
                     try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                    self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
+                    self.applyTapOutputState(to: tap, for: pid, deviceUIDs: [targetUID])
                     self.applyAutoEQToTap(tap)
                     self.applyDeviceAUChainToTap(tap)
                 } catch {
-                    self.logger.error("Failed to switch \(app.name) to \(targetUID): \(error.localizedDescription)")
+                    self.logger.error("Failed to switch \(appName) to \(targetUID): \(error.localizedDescription)")
                 }
             }
         }
