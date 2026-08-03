@@ -19,6 +19,7 @@ import Testing
 @testable import FineTune
 
 @Suite("ProcessTapController — Aggregate Planning")
+@MainActor
 struct AggregatePlanTests {
 
     @Test("Single plain device: unchanged, stays stacked")
