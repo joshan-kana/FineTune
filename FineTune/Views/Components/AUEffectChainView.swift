@@ -76,10 +76,16 @@ struct AUEffectChainView: View {
                 onOpenUI(entry.id)
             } label: {
                 HStack(spacing: 3) {
-                    Text(entry.pluginDescriptor.name)
-                        .font(.system(size: 11))
-                        .foregroundStyle(entry.isEnabled ? DesignTokens.Colors.textPrimary : DesignTokens.Colors.textTertiary)
-                        .lineLimit(1)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(entry.pluginDescriptor.name)
+                            .font(.system(size: 11))
+                            .foregroundStyle(entry.isEnabled ? DesignTokens.Colors.textPrimary : DesignTokens.Colors.textTertiary)
+                            .lineLimit(1)
+                        Text(processingModeLabel(entry))
+                            .font(.system(size: 8))
+                            .foregroundStyle(DesignTokens.Colors.textTertiary)
+                            .lineLimit(1)
+                    }
                     if failedEntryIDs.contains(entry.id) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 9))
@@ -164,5 +170,15 @@ struct AUEffectChainView: View {
             return match.name
         }
         return "Preset"
+    }
+
+    private func processingModeLabel(_ entry: AUEffectChainEntry) -> String {
+        switch entry.processingMode {
+        case .auto: return "Auto • native layout preferred"
+        case .nativeMultichannel: return "Native multichannel • layout required"
+        case .independentPerChannel: return "Independent per-channel"
+        case .stereoOnly: return "Stereo only • bypasses other layouts"
+        case .bypassForLayout: return "Bypass for current layout"
+        }
     }
 }

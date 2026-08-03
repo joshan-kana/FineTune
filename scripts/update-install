@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+git -C "$REPO_ROOT" fetch origin main
+git -C "$REPO_ROOT" pull --ff-only origin main
+exec "$SCRIPT_DIR/install" "$@"

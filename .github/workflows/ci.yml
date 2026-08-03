@@ -1,52 +1,51 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    runs-on: macos-26
-    timeout-minutes: 15
+  validate:
+    runs-on: macos-15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+      - name: Check out source
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          xcode-version: latest-stable
-
-      - name: Build
+          fetch-depth: 0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
+      - name: Record runner tools
         run: |
-          xcodebuild build \
-            -project FineTune.xcodeproj \
-            -scheme FineTune \
-            -configuration Debug \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_REQUIRED=NO
-
-      - name: Test
-        run: |
-          xcodebuild test \
-            -project FineTune.xcodeproj \
-            -scheme FineTune \
-            -configuration Debug \
-            -skip-testing:FineTuneUITests \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_REQUIRED=NO \
-            -resultBundlePath build/TestResults.xcresult
-
-      - name: Upload test results
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          nix --version
+      - name: Read-only lint
+        run: nix run .#lint
+      - name: Flake evaluation
+        run: nix flake check --impure --option sandbox false --no-build
+      - name: Build and test
+        run: nix run .#check
+      - name: Package smoke test
+        run: nix run .#package
+      - name: Upload build diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: test-results
-          path: build/TestResults.xcresult
-          retention-days: 7
+          name: finetune-diagnostics-${{ github.run_id }}
+          path: |
+            .build/Logs
+            .build/Results
+            dist/build-metadata.json
+            dist/SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 14

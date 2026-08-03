@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/xcode.sh"
+
+ensure_repo
+require_full_xcode
+mkdir_build_dirs
+result_bundle="$RESULTS_ROOT/tests-$(date +%Y%m%d-%H%M%S).xcresult"
+log_file="$LOG_ROOT/test-$(date +%Y%m%d-%H%M%S).log"
+info "running FineTune tests"
+set +e
+xcodebuild test -project "$(project_file)" -scheme "$(scheme_name)" -destination 'platform=macOS' \
+    -derivedDataPath "$DERIVED_DATA" -resultBundlePath "$result_bundle" \
+    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tee "$log_file"
+status=${PIPESTATUS[0]}
+set -e
+if ((status != 0)); then
+    warn "tests failed; xcresult preserved at $result_bundle"
+    exit "$status"
+fi
+info "tests passed: $result_bundle"

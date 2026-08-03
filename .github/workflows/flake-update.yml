@@ -1,0 +1,36 @@
+name: Flake update
+
+on:
+  schedule:
+    - cron: '31 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          fetch-depth: 0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
+      - name: Update and validate the lock file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git switch -C automation/flake-update origin/main
+          nix flake update
+          nix flake check --impure --option sandbox false --no-build
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add flake.lock
+          git commit -m 'chore(nix): update flake inputs' || exit 0
+          git push --force-with-lease origin HEAD:automation/flake-update
+          gh pr create --base main --head automation/flake-update --title 'chore(nix): update flake inputs' --body 'Automated pinned-input update; upstream source synchronization is intentionally separate.' || true
+          gh workflow run ci.yml --ref automation/flake-update

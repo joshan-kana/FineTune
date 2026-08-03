@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+if command -v nix >/dev/null 2>&1 && nix fmt --help >/dev/null 2>&1; then
+    exec nix fmt "$REPO_ROOT" "$@"
+fi
+command -v shfmt >/dev/null 2>&1 || die "shfmt is required; enter the Nix development shell"
+find "$REPO_ROOT/scripts" -type f -maxdepth 2 -print0 | xargs -0 shfmt -w

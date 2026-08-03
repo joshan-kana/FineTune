@@ -44,6 +44,25 @@ struct DeviceRow: View {
     let isFocused: Bool
     let iconOverrideSymbol: String?
 
+    // Per-device Audio Unit chain
+    let deviceAUEffectChain: [AUEffectChainEntry]
+    let isDeviceAUChainBypassed: Bool
+    let auPluginScanner: AUPluginScanner?
+    let getFavoriteAUPlugins: () -> Set<String>
+    let getAUCrashHistory: () -> Set<String>
+    let isFXExpanded: Bool
+    let onFXToggle: (() -> Void)?
+    let onAddDeviceAUEffect: ((AUPluginDescriptor) -> Void)?
+    let onRemoveDeviceAUEffect: ((UUID) -> Void)?
+    let onToggleDeviceAUEffect: ((UUID, Bool) -> Void)?
+    let onDeviceAUBypassToggle: (() -> Void)?
+    let onToggleAUFavorite: ((String) -> Void)?
+    let onOpenDeviceAUUI: ((UUID) -> Void)?
+    let onOpenDeviceAUGenericUI: ((UUID) -> Void)?
+    let deviceAUFailedEntryIDs: Set<UUID>
+    let getDeviceAUFactoryPresets: ((UUID) -> [(index: Int, name: String)])?
+    let onSelectDeviceAUFactoryPreset: ((UUID, Int) -> Void)?
+
     @State private var sliderValue: Double
     @State private var isEditing = false
     @State private var suppressSliderAutoUnmute = false
@@ -94,7 +113,24 @@ struct DeviceRow: View {
         autoEQPreampEnabled: Bool = true,
         onAutoEQPreampToggle: (() -> Void)? = nil,
         isFocused: Bool = false,
-        iconOverrideSymbol: String? = nil
+        iconOverrideSymbol: String? = nil,
+        deviceAUEffectChain: [AUEffectChainEntry] = [],
+        isDeviceAUChainBypassed: Bool = false,
+        auPluginScanner: AUPluginScanner? = nil,
+        getFavoriteAUPlugins: @escaping () -> Set<String> = { [] },
+        getAUCrashHistory: @escaping () -> Set<String> = { [] },
+        isFXExpanded: Bool = false,
+        onFXToggle: (() -> Void)? = nil,
+        onAddDeviceAUEffect: ((AUPluginDescriptor) -> Void)? = nil,
+        onRemoveDeviceAUEffect: ((UUID) -> Void)? = nil,
+        onToggleDeviceAUEffect: ((UUID, Bool) -> Void)? = nil,
+        onDeviceAUBypassToggle: (() -> Void)? = nil,
+        onToggleAUFavorite: ((String) -> Void)? = nil,
+        onOpenDeviceAUUI: ((UUID) -> Void)? = nil,
+        onOpenDeviceAUGenericUI: ((UUID) -> Void)? = nil,
+        deviceAUFailedEntryIDs: Set<UUID> = [],
+        getDeviceAUFactoryPresets: ((UUID) -> [(index: Int, name: String)])? = nil,
+        onSelectDeviceAUFactoryPreset: ((UUID, Int) -> Void)? = nil
     ) {
         self.device = device
         self.isDefault = isDefault
@@ -118,11 +154,50 @@ struct DeviceRow: View {
         self.onAutoEQPreampToggle = onAutoEQPreampToggle
         self.isFocused = isFocused
         self.iconOverrideSymbol = iconOverrideSymbol
+        self.deviceAUEffectChain = deviceAUEffectChain
+        self.isDeviceAUChainBypassed = isDeviceAUChainBypassed
+        self.auPluginScanner = auPluginScanner
+        self.getFavoriteAUPlugins = getFavoriteAUPlugins
+        self.getAUCrashHistory = getAUCrashHistory
+        self.isFXExpanded = isFXExpanded
+        self.onFXToggle = onFXToggle
+        self.onAddDeviceAUEffect = onAddDeviceAUEffect
+        self.onRemoveDeviceAUEffect = onRemoveDeviceAUEffect
+        self.onToggleDeviceAUEffect = onToggleDeviceAUEffect
+        self.onDeviceAUBypassToggle = onDeviceAUBypassToggle
+        self.onToggleAUFavorite = onToggleAUFavorite
+        self.onOpenDeviceAUUI = onOpenDeviceAUUI
+        self.onOpenDeviceAUGenericUI = onOpenDeviceAUGenericUI
+        self.deviceAUFailedEntryIDs = deviceAUFailedEntryIDs
+        self.getDeviceAUFactoryPresets = getDeviceAUFactoryPresets
+        self.onSelectDeviceAUFactoryPreset = onSelectDeviceAUFactoryPreset
         self._sliderValue = State(initialValue: Self.volumeToSlider(volume, backend: volumeBackend))
     }
 
     var body: some View {
-        deviceHeader
+        VStack(spacing: 0) {
+            deviceHeader
+            if let scanner = auPluginScanner, isFXExpanded {
+                AUEffectChainView(
+                    entries: deviceAUEffectChain,
+                    isBypassed: isDeviceAUChainBypassed,
+                    scanner: scanner,
+                    getFavoriteIDs: getFavoriteAUPlugins,
+                    getCrashHistory: getAUCrashHistory,
+                    onToggle: { id, enabled in onToggleDeviceAUEffect?(id, enabled) },
+                    onRemove: { id in onRemoveDeviceAUEffect?(id) },
+                    onAddEffect: { plugin in onAddDeviceAUEffect?(plugin) },
+                    onBypassToggle: { onDeviceAUBypassToggle?() },
+                    onToggleFavorite: { id in onToggleAUFavorite?(id) },
+                    onOpenUI: { id in onOpenDeviceAUUI?(id) },
+                    onOpenGenericUI: { id in onOpenDeviceAUGenericUI?(id) },
+                    failedEntryIDs: deviceAUFailedEntryIDs,
+                    getFactoryPresets: getDeviceAUFactoryPresets,
+                    onSelectFactoryPreset: onSelectDeviceAUFactoryPreset
+                )
+                .padding(.horizontal, 8)
+            }
+        }
             .contentShape(Rectangle())
             .onTapGesture {
                 // Whole-row tap sets this device as default. Inner controls
@@ -184,6 +259,18 @@ struct DeviceRow: View {
                         preampEnabled: autoEQPreampEnabled,
                         onPreampToggle: onAutoEQPreampToggle
                     )
+                }
+
+                if auPluginScanner != nil {
+                    Button {
+                        onFXToggle?()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 10))
+                            .foregroundStyle(isFXExpanded ? Color.accentColor : DesignTokens.Colors.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Audio Unit effects")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
+    die "worktree is dirty; commit or preserve changes before synchronization"
+fi
+git -C "$REPO_ROOT" fetch --all --tags --prune
+git -C "$REPO_ROOT" switch main
+git -C "$REPO_ROOT" merge --ff-only upstream/main
+info "upstream/main is now integrated into main"

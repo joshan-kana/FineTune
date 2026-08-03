@@ -107,9 +107,9 @@ final class AutoEQProcessor: BiquadProcessor, @unchecked Sendable {
     }
 
     /// Apply preamp gain before the biquad cascade (RT-safe).
-    override func preProcess(output: UnsafeMutablePointer<Float>, frameCount: Int) {
+    override func preProcess(output: UnsafeMutablePointer<Float>, frameCount: Int, channelCount: Int) {
         var preamp = _preampGain
-        let sampleCount = frameCount * 2
+        let sampleCount = frameCount * channelCount
         vDSP_vsmul(output, 1, &preamp, output, 1, vDSP_Length(sampleCount))
     }
 }

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' 'legacy audio inspection requires macOS Core Audio.'
+    exit 1
+fi
+printf '%s\n' 'FineTune DSP Bus:'
+system_profiler SPAudioDataType 2>/dev/null | grep -F 'FineTune DSP Bus' || printf '%s\n' '  not found'
+printf '%s\n' 'BlackHole devices:'
+system_profiler SPAudioDataType 2>/dev/null | grep -F 'BlackHole' || printf '%s\n' '  not found'
+printf '%s\n' 'Kushview Element:'
+if [[ -d /Applications/Element.app ]]; then printf '%s\n' '  /Applications/Element.app'; else printf '%s\n' '  not found'; fi
+printf '%s\n' 'The active system output is intentionally not changed by this check.'

@@ -7,6 +7,8 @@ struct AUEffectChainEntry: Codable, Identifiable, Equatable {
     var isEnabled: Bool
     var presetData: Data?
     var selectedFactoryPresetIndex: Int?
+    var processingMode: AUProcessingMode
+    var channelSelection: AUChannelSelection
 
     init(plugin: AUPluginDescriptor, isEnabled: Bool = true) {
         self.id = UUID()
@@ -14,6 +16,8 @@ struct AUEffectChainEntry: Codable, Identifiable, Equatable {
         self.isEnabled = isEnabled
         self.presetData = nil
         self.selectedFactoryPresetIndex = nil
+        self.processingMode = .auto
+        self.channelSelection = .allChannels
     }
 }
 

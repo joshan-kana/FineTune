@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+info "formatting Nix and shell sources; Swift sources are left to swift-format"
+if command -v nix >/dev/null 2>&1; then nix fmt "$REPO_ROOT"; fi
+if command -v shfmt >/dev/null 2>&1; then find "$REPO_ROOT/scripts" -type f -maxdepth 2 -print0 | xargs -0 shfmt -w; fi
+if command -v swift-format >/dev/null 2>&1; then swift-format format --in-place --recursive "$REPO_ROOT/FineTune" "$REPO_ROOT/FineTuneTests"; fi

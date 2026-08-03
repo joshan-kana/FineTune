@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' 'FineTune latency benchmark requires macOS Core Audio.'
+    exit 1
+fi
+printf '%s\n' "sample rate: use the active device's nominal rate"
+printf '%s\n' 'buffer duration: active device buffer size / sample rate'
+printf '%s\n' 'FineTune callback/AU timings: exposed by the diagnostic build'
+printf '%s\n' 'reported plugin latency: exposed per effect in the AU chain UI'
+printf '%s\n' 'end-to-end physical device and HDMI latency are not included'

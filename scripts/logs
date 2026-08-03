@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' 'FineTune logs require macOS unified logging.' >&2
+    exit 1
+fi
+predicate='process == "FineTune" OR subsystem CONTAINS "FineTune"'
+if [[ "${1:-}" == "--live" ]]; then
+    exec log stream --style compact --predicate "$predicate"
+fi
+exec log show --last "${FINETUNE_LOG_WINDOW:-1h}" --style compact --predicate "$predicate"
