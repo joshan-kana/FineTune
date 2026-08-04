@@ -70,6 +70,42 @@ struct AUEffectRenderHandoffTests {
     }
 }
 
+@Suite("AU publication transaction")
+struct AUEffectChainPublicationTransactionTests {
+
+    @Test("Paired success publishes one generation")
+    func pairedSuccess() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(true)
+        #expect(transaction.canPublish(for: 7))
+    }
+
+    @Test("Primary success and secondary timeout do not publish")
+    func secondaryTimeout() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(false)
+        #expect(!transaction.canPublish(for: 7))
+    }
+
+    @Test("Both timed-out handoffs do not publish")
+    func bothTimeout() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(false)
+        transaction.recordSecondary(false)
+        #expect(!transaction.canPublish(for: 7))
+    }
+
+    @Test("A superseded generation cannot publish")
+    func supersededGeneration() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(true)
+        #expect(!transaction.canPublish(for: 8))
+    }
+}
+
 // MARK: - AUPluginDescriptor Tests
 
 @Suite("AUPluginDescriptor")
@@ -684,6 +720,23 @@ struct AUEffectChainTests {
         #expect(buffer == original)
     }
 
+    @Test("Timed-out handoff preserves the old chain and resumes after cancellation")
+    func timedOutHandoffPreservesOldChain() {
+        let entry = AUEffectChainEntry(plugin: appleLowPassFilter())
+        let chain = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 256)
+        let originalEntries = chain.entries
+        #expect(chain.beginRenderForTesting())
+
+        let retirementToken = chain.beginRetirement()
+        #expect(chain.waitForRenderQuiescence(timeout: 0.001) == false)
+        chain.cancelRetirement(ifToken: retirementToken)
+        chain.endRenderForTesting()
+
+        #expect(chain.entries == originalEntries)
+        #expect(chain.beginRenderForTesting())
+        chain.endRenderForTesting()
+    }
+
     private func appleAUDelay() -> AUPluginDescriptor {
         AUPluginDescriptor(
             componentType: kAudioUnitType_Effect,
@@ -735,15 +788,117 @@ struct AUEffectPeerRegistryTests {
         #expect(registry.hostCountForTesting(entryID: entryID) == 0)
     }
 
-    @Test("Parameter observer installation tolerates AUs without a parameter list")
-    func discoversConcreteParameters() {
-        let host = AUEffectHost(descriptor: appleLowPassFilter(), entryID: UUID(), sampleRate: 44100)
-        #expect(host.instantiate())
-        host.installParameterObserver { _, _ in }
-        // Some macOS built-in effects expose no kAudioUnitProperty_ParameterList;
-        // the important contract is that registration remains safe and never
-        // falls back to a wildcard listener.
-        #expect(host.observedParameterCountForTesting >= 0)
+    @Test("Two independent mono hosts synchronize and exclude the source")
+    func independentMonoHostsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        let source = makeHost(entryID: entryID, format: format(channelCount: 1), mode: .independentPerChannel)
+        let peer = makeHost(entryID: entryID, format: format(channelCount: 1), mode: .independentPerChannel)
+        let callback = DispatchSemaphore(value: 0)
+        var peerUpdates = 0
+        var sourceUpdates = 0
+
+        source.setPeerParameterSetterForTesting { _ in
+            sourceUpdates += 1
+            return noErr
+        }
+        peer.setPeerParameterSetterForTesting { value in
+            peerUpdates += 1
+            callback.signal()
+            registry.emitParameterChangeForTesting(entryID: entryID, source: peer, parameterID: 7, value: value)
+            return noErr
+        }
+        registry.register([source, peer], entryID: entryID, ownerID: ownerID)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 7, value: 0.5)
+
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(peerUpdates == 1)
+        #expect(sourceUpdates == 0)
+        registry.unregisterSynchronouslyForTesting([source, peer], entryID: entryID, ownerID: ownerID)
+    }
+
+    @Test("5.1 and 7.1 host groups fan out to every independent host")
+    func multichannelHostGroupsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        #expect(synchronizeHostGroup(registry: registry, channelCount: 6, expectedPeers: 5))
+        #expect(synchronizeHostGroup(registry: registry, channelCount: 8, expectedPeers: 7))
+    }
+
+    @Test("Two simulated device tap groups share parameter peers")
+    func deviceTapGroupsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let firstOwner = UUID()
+        let secondOwner = UUID()
+        let firstGroup = [
+            makeHost(entryID: entryID, format: format(channelCount: 1)),
+            makeHost(entryID: entryID, format: format(channelCount: 1))
+        ]
+        let secondGroup = [
+            makeHost(entryID: entryID, format: format(channelCount: 1)),
+            makeHost(entryID: entryID, format: format(channelCount: 1))
+        ]
+        let callback = DispatchSemaphore(value: 0)
+        var updates = 0
+        for host in secondGroup {
+            host.setPeerParameterSetterForTesting { _ in
+                updates += 1
+                callback.signal()
+                return noErr
+            }
+        }
+
+        registry.register(firstGroup, entryID: entryID, ownerID: firstOwner)
+        registry.register(secondGroup, entryID: entryID, ownerID: secondOwner)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: firstGroup[0], parameterID: 3, value: 0.25)
+
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(updates == 2)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 4)
+        registry.unregisterSynchronouslyForTesting(firstGroup, entryID: entryID, ownerID: firstOwner)
+        registry.unregisterSynchronouslyForTesting(secondGroup, entryID: entryID, ownerID: secondOwner)
+    }
+
+    @Test("Failed peer updates clear suppression for the next source change")
+    func failedPeerUpdateClearsSuppression() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        let source = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let peer = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let callback = DispatchSemaphore(value: 0)
+        var shouldFail = true
+        var updates = 0
+        peer.setPeerParameterSetterForTesting { _ in
+            updates += 1
+            callback.signal()
+            return shouldFail ? -1 : noErr
+        }
+        registry.register([source, peer], entryID: entryID, ownerID: ownerID)
+
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 9, value: 0.75)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        shouldFail = false
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 9, value: 0.8)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(updates == 2)
+        registry.unregisterSynchronouslyForTesting([source, peer], entryID: entryID, ownerID: ownerID)
+    }
+
+    @Test("Stale hosts are removed from peer groups")
+    func staleHostCleanup() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        var stale: AUEffectHost? = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let live = makeHost(entryID: entryID, format: format(channelCount: 1))
+        registry.register([stale!, live], entryID: entryID, ownerID: ownerID)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+        stale = nil
+        #expect(registry.hostCountForTesting(entryID: entryID) == 1)
+        registry.unregisterSynchronouslyForTesting([live], entryID: entryID, ownerID: ownerID)
     }
 
     @Test("Failed preset load leaves the host available for rendering")
@@ -774,6 +929,69 @@ struct AUEffectPeerRegistryTests {
             manufacturer: "Apple",
             version: 1
         )
+    }
+
+    private func makeHost(
+        entryID: UUID,
+        format: AudioStreamFormatDescription,
+        mode: AUProcessingMode = .auto
+    ) -> AUEffectHost {
+        AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: entryID,
+            sampleRate: format.sampleRate,
+            format: format,
+            processingMode: mode
+        )
+    }
+
+    private func format(channelCount: Int) -> AudioStreamFormatDescription {
+        let tag: AudioChannelLayoutTag?
+        switch channelCount {
+        case 1: tag = kAudioChannelLayoutTag_Mono
+        case 6: tag = kAudioChannelLayoutTag_AudioUnit_5_1
+        case 8: tag = kAudioChannelLayoutTag_AudioUnit_7_1
+        default: tag = nil
+        }
+        return AudioStreamFormatDescription(
+            sampleRate: 44100,
+            frameCapacity: 64,
+            channelCount: channelCount,
+            isInterleaved: false,
+            channelLayoutTag: tag
+        )
+    }
+
+    private func synchronizeHostGroup(
+        registry: AUEffectPeerRegistry,
+        channelCount: Int,
+        expectedPeers: Int
+    ) -> Bool {
+        let entryID = UUID()
+        let ownerID = UUID()
+        let hosts = (0..<channelCount).map { _ in
+            makeHost(entryID: entryID, format: format(channelCount: channelCount), mode: .independentPerChannel)
+        }
+        let callback = DispatchSemaphore(value: 0)
+        var updates = 0
+        for host in hosts.dropFirst() {
+            host.setPeerParameterSetterForTesting { _ in
+                updates += 1
+                callback.signal()
+                return noErr
+            }
+        }
+        registry.register(hosts, entryID: entryID, ownerID: ownerID)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: hosts[0], parameterID: 11, value: 0.4)
+        for _ in 0..<expectedPeers {
+            guard callback.wait(timeout: .now() + 1) == .success else {
+                registry.unregisterSynchronouslyForTesting(hosts, entryID: entryID, ownerID: ownerID)
+                return false
+            }
+        }
+        let result = updates == expectedPeers && registry.hostCountForTesting(entryID: entryID) == channelCount
+        registry.unregisterSynchronouslyForTesting(hosts, entryID: entryID, ownerID: ownerID)
+        return result
     }
 }
 

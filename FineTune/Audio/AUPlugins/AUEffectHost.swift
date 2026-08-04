@@ -57,7 +57,15 @@ final class AUEffectHost: @unchecked Sendable {
     var audioUnit: AudioUnit? { _audioUnit }
 
     #if DEBUG
-    var observedParameterCountForTesting: Int { observedParameters.count }
+    private var peerParameterSetterForTesting: ((AudioUnitParameterValue) -> OSStatus)?
+
+    func setPeerParameterSetterForTesting(_ setter: ((AudioUnitParameterValue) -> OSStatus)?) {
+        peerParameterSetterForTesting = setter
+    }
+
+    func applyPeerParameterForTesting(_ value: AudioUnitParameterValue) -> OSStatus? {
+        peerParameterSetterForTesting?(value)
+    }
     #endif
 
     var compatibilityDescription: String {

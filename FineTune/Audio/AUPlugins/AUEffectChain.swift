@@ -305,6 +305,17 @@ final class AUEffectChain: @unchecked Sendable {
         renderHandoff.waitForQuiescence(timeout: timeout)
     }
 
+    #if DEBUG
+    @discardableResult
+    func beginRenderForTesting() -> Bool {
+        renderHandoff.beginRender()
+    }
+
+    func endRenderForTesting() {
+        renderHandoff.endRender()
+    }
+    #endif
+
     func host(for entryID: UUID) -> AUEffectHost? {
         _hosts.first { $0.entryID == entryID }
     }
@@ -423,6 +434,26 @@ final class AUEffectPeerRegistry: @unchecked Sendable {
         let coordinator = coordinators[entryID]
         lock.unlock()
         return coordinator?.hostCount ?? 0
+    }
+
+    func emitParameterChangeForTesting(
+        entryID: UUID,
+        source: AUEffectHost,
+        parameterID: AudioUnitParameterID,
+        scope: AudioUnitScope = kAudioUnitScope_Global,
+        element: AudioUnitElement = 0,
+        value: AudioUnitParameterValue
+    ) {
+        lock.lock()
+        let coordinator = coordinators[entryID]
+        lock.unlock()
+        coordinator?.parameterChangedForTesting(
+            from: source,
+            parameterID: parameterID,
+            scope: scope,
+            element: element,
+            value: value
+        )
     }
     #endif
 
@@ -597,9 +628,40 @@ private final class AUEffectPeerCoordinator: @unchecked Sendable {
     }
 
     private func parameterChanged(from source: AUEffectHost, parameter: AudioUnitParameter, value: AudioUnitParameterValue) {
-        let parameterID = parameter.mParameterID
-        let scope = parameter.mScope
-        let element = parameter.mElement
+        parameterChanged(
+            from: source,
+            parameterID: parameter.mParameterID,
+            scope: parameter.mScope,
+            element: parameter.mElement,
+            value: value
+        )
+    }
+
+    #if DEBUG
+    func parameterChangedForTesting(
+        from source: AUEffectHost,
+        parameterID: AudioUnitParameterID,
+        scope: AudioUnitScope,
+        element: AudioUnitElement,
+        value: AudioUnitParameterValue
+    ) {
+        parameterChanged(
+            from: source,
+            parameterID: parameterID,
+            scope: scope,
+            element: element,
+            value: value
+        )
+    }
+    #endif
+
+    private func parameterChanged(
+        from source: AUEffectHost,
+        parameterID: AudioUnitParameterID,
+        scope: AudioUnitScope,
+        element: AudioUnitElement,
+        value: AudioUnitParameterValue
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             self.hosts.removeAll { $0.value == nil }
@@ -614,7 +676,7 @@ private final class AUEffectPeerCoordinator: @unchecked Sendable {
             }
 
             for weakHost in self.hosts {
-                guard let host = weakHost.value, host !== source, let au = host.audioUnit else { continue }
+                guard let host = weakHost.value, host !== source else { continue }
                 let peerKey = ParameterKey(
                     hostID: ObjectIdentifier(host),
                     parameterID: parameterID,
@@ -622,18 +684,40 @@ private final class AUEffectPeerCoordinator: @unchecked Sendable {
                     element: element
                 )
                 self.suppressed[peerKey] = value
-                var peerParameter = AudioUnitParameter(
-                    mAudioUnit: au,
-                    mParameterID: parameterID,
-                    mScope: scope,
-                    mElement: element
+                let status = self.setParameter(
+                    on: host,
+                    parameterID: parameterID,
+                    scope: scope,
+                    element: element,
+                    value: value
                 )
-                let status = AUParameterSet(nil, nil, &peerParameter, value, 0)
                 if status != noErr {
                     self.suppressed.removeValue(forKey: peerKey)
                     self.logger.warning("Failed to mirror AU parameter \(parameterID): \(status)")
                 }
             }
         }
+    }
+
+    private func setParameter(
+        on host: AUEffectHost,
+        parameterID: AudioUnitParameterID,
+        scope: AudioUnitScope,
+        element: AudioUnitElement,
+        value: AudioUnitParameterValue
+    ) -> OSStatus {
+        #if DEBUG
+        if let testStatus = host.applyPeerParameterForTesting(value) {
+            return testStatus
+        }
+        #endif
+        guard let au = host.audioUnit else { return -1 }
+        var parameter = AudioUnitParameter(
+            mAudioUnit: au,
+            mParameterID: parameterID,
+            mScope: scope,
+            mElement: element
+        )
+        return AUParameterSet(nil, nil, &parameter, value, 0)
     }
 }

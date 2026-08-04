@@ -3,6 +3,37 @@ import AudioToolbox
 import Foundation
 import os
 
+/// Records whether both halves of one immutable AU publication reached a safe
+/// handoff. The transaction is intentionally local to one generation: a
+/// superseded generation can never commit its entries or either chain.
+struct AUEffectChainPublicationTransaction: Equatable {
+    let generation: UInt64
+    let requiresSecondary: Bool
+    private(set) var primaryCompleted = false
+    private(set) var secondaryCompleted = false
+    private(set) var primarySucceeded = false
+    private(set) var secondarySucceeded = false
+
+    mutating func recordPrimary(_ succeeded: Bool) {
+        primaryCompleted = true
+        primarySucceeded = succeeded
+    }
+
+    mutating func recordSecondary(_ succeeded: Bool) {
+        secondaryCompleted = true
+        secondarySucceeded = succeeded
+    }
+
+    var shouldPublish: Bool {
+        primaryCompleted && primarySucceeded &&
+            (!requiresSecondary || (secondaryCompleted && secondarySucceeded))
+    }
+
+    func canPublish(for currentGeneration: UInt64) -> Bool {
+        generation == currentGeneration && shouldPublish
+    }
+}
+
 // MARK: - Threading Model
 //
 // ProcessTapController bridges two execution domains:
@@ -314,7 +345,6 @@ final class ProcessTapController: ProcessTapControlling {
         let format = currentAUFormat()
         let old = auEffectChain
         let preparedEntries = prepareEntriesForReplacement(entries, oldChain: old, format: format)
-        _currentAUEntries = preparedEntries
         let newChain = preparedEntries.isEmpty ? nil : AUEffectChain(
             entries: preparedEntries,
             sampleRate: format.sampleRate,
@@ -323,17 +353,25 @@ final class ProcessTapController: ProcessTapControlling {
         )
         let bypassed = old?.isBypassed == true
         auChainGeneration &+= 1
-        scheduleAUChainHandoff(old: old, replacement: newChain, generation: auChainGeneration, secondary: false, device: false, bypassed: bypassed)
-        if secondaryResources.isActive {
-            let oldSecondary = secondaryAUEffectChain
-            let newSecondary = preparedEntries.isEmpty ? nil : AUEffectChain(
-                entries: preparedEntries,
-                sampleRate: format.sampleRate,
-                format: format,
-                reusing: oldSecondary
-            )
-            scheduleAUChainHandoff(old: oldSecondary, replacement: newSecondary, generation: auChainGeneration, secondary: true, device: false, bypassed: oldSecondary?.isBypassed == true || bypassed)
-        }
+        let hasSecondary = secondaryResources.isActive
+        let oldSecondary = hasSecondary ? secondaryAUEffectChain : nil
+        let newSecondary = hasSecondary && !preparedEntries.isEmpty ? AUEffectChain(
+            entries: preparedEntries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: oldSecondary
+        ) : nil
+        scheduleAUChainHandoff(
+            old: old,
+            replacement: newChain,
+            secondaryOld: oldSecondary,
+            secondaryReplacement: newSecondary,
+            generation: auChainGeneration,
+            requiresSecondary: hasSecondary,
+            device: false,
+            bypassed: oldSecondary?.isBypassed == true || bypassed,
+            entries: preparedEntries
+        )
     }
 
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { _currentAUEntries }
@@ -353,7 +391,6 @@ final class ProcessTapController: ProcessTapControlling {
         let format = currentAUFormat()
         let old = deviceAUEffectChain
         let preparedEntries = prepareEntriesForReplacement(entries, oldChain: old, format: format)
-        _currentDeviceAUEntries = preparedEntries
         let newChain = preparedEntries.isEmpty ? nil : AUEffectChain(
             entries: preparedEntries,
             sampleRate: format.sampleRate,
@@ -362,17 +399,25 @@ final class ProcessTapController: ProcessTapControlling {
         )
         let bypassed = old?.isBypassed == true
         deviceAUChainGeneration &+= 1
-        scheduleAUChainHandoff(old: old, replacement: newChain, generation: deviceAUChainGeneration, secondary: false, device: true, bypassed: bypassed)
-        if secondaryResources.isActive {
-            let oldSecondary = secondaryDeviceAUEffectChain
-            let newSecondary = preparedEntries.isEmpty ? nil : AUEffectChain(
-                entries: preparedEntries,
-                sampleRate: format.sampleRate,
-                format: format,
-                reusing: oldSecondary
-            )
-            scheduleAUChainHandoff(old: oldSecondary, replacement: newSecondary, generation: deviceAUChainGeneration, secondary: true, device: true, bypassed: oldSecondary?.isBypassed == true || bypassed)
-        }
+        let hasSecondary = secondaryResources.isActive
+        let oldSecondary = hasSecondary ? secondaryDeviceAUEffectChain : nil
+        let newSecondary = hasSecondary && !preparedEntries.isEmpty ? AUEffectChain(
+            entries: preparedEntries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: oldSecondary
+        ) : nil
+        scheduleAUChainHandoff(
+            old: old,
+            replacement: newChain,
+            secondaryOld: oldSecondary,
+            secondaryReplacement: newSecondary,
+            generation: deviceAUChainGeneration,
+            requiresSecondary: hasSecondary,
+            device: true,
+            bypassed: oldSecondary?.isBypassed == true || bypassed,
+            entries: preparedEntries
+        )
     }
 
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { _currentDeviceAUEntries }
@@ -436,57 +481,84 @@ final class ProcessTapController: ProcessTapControlling {
     private func scheduleAUChainHandoff(
         old: AUEffectChain?,
         replacement: AUEffectChain?,
+        secondaryOld: AUEffectChain?,
+        secondaryReplacement: AUEffectChain?,
         generation: UInt64,
-        secondary: Bool,
+        requiresSecondary: Bool,
         device: Bool,
-        bypassed: Bool
+        bypassed: Bool,
+        entries: [AUEffectChainEntry]
     ) {
-        guard let old else {
-            publishAUChain(replacement, secondary: secondary, device: device, bypassed: bypassed)
-            updateMaxTailTime()
-            return
-        }
+        let retirementToken = old?.beginRetirement()
+        let secondaryRetirementToken = secondaryOld?.beginRetirement()
+        Task.detached(priority: .userInitiated) { [weak self, old, replacement, secondaryOld, secondaryReplacement] in
+            let primaryQuiesced = old?.waitForRenderQuiescence() ?? true
+            let secondaryQuiesced = requiresSecondary ? (secondaryOld?.waitForRenderQuiescence() ?? true) : true
+            var transaction = AUEffectChainPublicationTransaction(
+                generation: generation,
+                requiresSecondary: requiresSecondary
+            )
+            transaction.recordPrimary(primaryQuiesced)
+            transaction.recordSecondary(secondaryQuiesced)
 
-        let retirementToken = old.beginRetirement()
-        Task.detached(priority: .userInitiated) { [weak self, old, replacement] in
-            let quiesced = old.waitForRenderQuiescence()
-            if quiesced {
-                for entry in old.entries {
-                    if let host = old.host(for: entry.id) {
-                        AUEffectPeerRegistry.shared.reconcileSynchronously(entryID: entry.id, source: host)
+            if transaction.shouldPublish {
+                for chain in [old, secondaryOld].compactMap({ $0 }) {
+                    for entry in chain.entries {
+                        if let host = chain.host(for: entry.id) {
+                            AUEffectPeerRegistry.shared.reconcileSynchronously(entryID: entry.id, source: host)
+                        }
                     }
                 }
             }
             await MainActor.run { [weak self, old, replacement] in
                 guard let self else {
-                    old.cancelRetirement(ifToken: retirementToken)
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
                     return
                 }
                 let currentGeneration = device ? self.deviceAUChainGeneration : self.auChainGeneration
                 guard currentGeneration == generation else {
-                    old.cancelRetirement(ifToken: retirementToken)
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
                     return
                 }
-                guard quiesced else {
-                    old.cancelRetirement(ifToken: retirementToken)
-                    self.logger.warning("AU chain handoff timed out after \(AUEffectRenderHandoff.maximumWait, privacy: .public)s; preserving the active chain")
+                guard transaction.canPublish(for: currentGeneration) else {
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    self.logger.warning("AU chain handoff timed out after \(AUEffectRenderHandoff.maximumWait, privacy: .public)s; preserving the active chain and reported entries")
                     return
                 }
-                self.publishAUChain(replacement, secondary: secondary, device: device, bypassed: bypassed)
+                self.publishAUChainPair(
+                    replacement,
+                    secondary: secondaryReplacement,
+                    publishSecondary: requiresSecondary,
+                    device: device,
+                    bypassed: bypassed,
+                    entries: entries
+                )
                 self.updateMaxTailTime()
             }
         }
     }
 
-    private func publishAUChain(_ chain: AUEffectChain?, secondary: Bool, device: Bool, bypassed: Bool) {
+    private func publishAUChainPair(
+        _ chain: AUEffectChain?,
+        secondary: AUEffectChain?,
+        publishSecondary: Bool,
+        device: Bool,
+        bypassed: Bool,
+        entries: [AUEffectChainEntry]
+    ) {
         chain?.setBypassed(bypassed)
+        secondary?.setBypassed(bypassed)
         if device {
-            if secondary { secondaryDeviceAUEffectChain = chain }
-            else { deviceAUEffectChain = chain }
-        } else if secondary {
-            secondaryAUEffectChain = chain
+            deviceAUEffectChain = chain
+            if publishSecondary { secondaryDeviceAUEffectChain = secondary }
+            _currentDeviceAUEntries = entries
         } else {
             auEffectChain = chain
+            if publishSecondary { secondaryAUEffectChain = secondary }
+            _currentAUEntries = entries
         }
     }
 
