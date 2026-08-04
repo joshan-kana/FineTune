@@ -342,6 +342,13 @@ final class ProcessTapController: ProcessTapControlling {
     }
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {
+        updateAUEffectChain(entries) { _ in }
+    }
+
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
         let format = currentAUFormat()
         let old = auEffectChain
         let preparedEntries = prepareEntriesForReplacement(entries, oldChain: old, format: format)
@@ -370,7 +377,8 @@ final class ProcessTapController: ProcessTapControlling {
             requiresSecondary: hasSecondary,
             device: false,
             bypassed: oldSecondary?.isBypassed == true || bypassed,
-            entries: preparedEntries
+            entries: preparedEntries,
+            completion: completion
         )
     }
 
@@ -388,6 +396,13 @@ final class ProcessTapController: ProcessTapControlling {
     var isAUChainBypassed: Bool { auEffectChain?.isBypassed ?? false }
 
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry]) {
+        updateDeviceAUEffectChain(entries) { _ in }
+    }
+
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
         let format = currentAUFormat()
         let old = deviceAUEffectChain
         let preparedEntries = prepareEntriesForReplacement(entries, oldChain: old, format: format)
@@ -416,7 +431,8 @@ final class ProcessTapController: ProcessTapControlling {
             requiresSecondary: hasSecondary,
             device: true,
             bypassed: oldSecondary?.isBypassed == true || bypassed,
-            entries: preparedEntries
+            entries: preparedEntries,
+            completion: completion
         )
     }
 
@@ -457,15 +473,10 @@ final class ProcessTapController: ProcessTapControlling {
             let replacementIndex = prepared.firstIndex(where: { $0.id == oldEntry.id })
             let remainsCompatible = replacementIndex.map { oldChain.canReuseHost(for: prepared[$0], format: format) } ?? false
             guard !remainsCompatible, let oldHost = oldChain.host(for: oldEntry.id) else {
-                if replacementIndex == nil {
-                    AUPluginWindowManager.shared.saveWindow(for: oldEntry.id)
-                    AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
-                }
                 continue
             }
 
             AUEffectPeerRegistry.shared.reconcile(entryID: oldEntry.id, source: oldHost)
-            AUPluginWindowManager.shared.saveWindow(for: oldEntry.id)
             if let replacementIndex,
                prepared[replacementIndex].presetData == oldEntry.presetData,
                prepared[replacementIndex].selectedFactoryPresetIndex == oldEntry.selectedFactoryPresetIndex,
@@ -473,9 +484,22 @@ final class ProcessTapController: ProcessTapControlling {
                 prepared[replacementIndex].presetData = preset
                 prepared[replacementIndex].selectedFactoryPresetIndex = nil
             }
-            AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
         }
         return prepared
+    }
+
+    private func closeReplacedPluginWindows(
+        oldChain: AUEffectChain?,
+        replacementEntries: [AUEffectChainEntry]
+    ) {
+        guard let oldChain else { return }
+        for oldEntry in oldChain.entries {
+            guard let replacementEntry = replacementEntries.first(where: { $0.id == oldEntry.id }),
+                  oldChain.canReuseHost(for: replacementEntry) else {
+                AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
+                continue
+            }
+        }
     }
 
     private func scheduleAUChainHandoff(
@@ -487,7 +511,8 @@ final class ProcessTapController: ProcessTapControlling {
         requiresSecondary: Bool,
         device: Bool,
         bypassed: Bool,
-        entries: [AUEffectChainEntry]
+        entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
     ) {
         let retirementToken = old?.beginRetirement()
         let secondaryRetirementToken = secondaryOld?.beginRetirement()
@@ -501,33 +526,28 @@ final class ProcessTapController: ProcessTapControlling {
             transaction.recordPrimary(primaryQuiesced)
             transaction.recordSecondary(secondaryQuiesced)
 
-            if transaction.shouldPublish {
-                for chain in [old, secondaryOld].compactMap({ $0 }) {
-                    for entry in chain.entries {
-                        if let host = chain.host(for: entry.id) {
-                            AUEffectPeerRegistry.shared.reconcileSynchronously(entryID: entry.id, source: host)
-                        }
-                    }
-                }
-            }
             await MainActor.run { [weak self, old, replacement] in
                 guard let self else {
                     if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
                     if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    completion(.superseded)
                     return
                 }
                 let currentGeneration = device ? self.deviceAUChainGeneration : self.auChainGeneration
                 guard currentGeneration == generation else {
                     if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
                     if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    completion(.superseded)
                     return
                 }
                 guard transaction.canPublish(for: currentGeneration) else {
                     if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
                     if let secondaryRetirementToken { secondaryOld?.cancelRetirement(ifToken: secondaryRetirementToken) }
                     self.logger.warning("AU chain handoff timed out after \(AUEffectRenderHandoff.maximumWait, privacy: .public)s; preserving the active chain and reported entries")
+                    completion(.rejected(reason: .timedOut))
                     return
                 }
+                self.closeReplacedPluginWindows(oldChain: old, replacementEntries: entries)
                 self.publishAUChainPair(
                     replacement,
                     secondary: secondaryReplacement,
@@ -537,6 +557,7 @@ final class ProcessTapController: ProcessTapControlling {
                     entries: entries
                 )
                 self.updateMaxTailTime()
+                completion(.committed)
             }
         }
     }

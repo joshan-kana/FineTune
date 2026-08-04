@@ -4,6 +4,21 @@ import Foundation
 import os
 import UserNotifications
 
+private struct PendingAppAURequest {
+    let token: UUID
+    let state: AUChainState
+}
+
+private struct PendingDeviceAURequest {
+    let token: UUID
+    let state: AUChainState
+    let previousEntries: [AUEffectChainEntry]
+    let expectedPIDs: Set<pid_t>
+    var completedPIDs: Set<pid_t> = []
+    var committedPIDs: Set<pid_t> = []
+    var failed = false
+}
+
 @Observable
 @MainActor
 final class AudioEngine {
@@ -32,6 +47,8 @@ final class AudioEngine {
     private(set) var appAU: [String: AUChainState] = [:]
     /// Per-device AU state. Keyed by device UID.
     private(set) var deviceAU: [String: AUChainState] = [:]
+    private var pendingAppAU: [String: PendingAppAURequest] = [:]
+    private var pendingDeviceAU: [String: PendingDeviceAURequest] = [:]
     /// Favorited AU plugin IDs.
     private(set) var favoriteAUPluginIDs: Set<String> = []
     /// Plugin IDs that were active during a crash.
@@ -809,20 +826,21 @@ final class AudioEngine {
     // MARK: - Per-App AU Effect Chains
 
     func addAUEffect(for app: AudioApp, plugin: AUPluginDescriptor) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         state.entries.append(AUEffectChainEntry(plugin: plugin))
         commitAppAU(state, for: app)
     }
 
     func removeAUEffect(for app: AudioApp, entryID: UUID) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         state.entries.removeAll { $0.id == entryID }
-        commitAppAU(state, for: app)
-        AUPluginWindowManager.shared.closeWindow(for: entryID)
+        commitAppAU(state, for: app) {
+            AUPluginWindowManager.shared.closeWindow(for: entryID)
+        }
     }
 
     func toggleAUEffect(for app: AudioApp, entryID: UUID, enabled: Bool) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         if let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].isEnabled = enabled
         }
@@ -830,7 +848,7 @@ final class AudioEngine {
     }
 
     func reorderAUEffects(for app: AudioApp, entries: [AUEffectChainEntry]) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         state.entries = entries
         commitAppAU(state, for: app)
     }
@@ -840,7 +858,7 @@ final class AudioEngine {
     }
 
     func updateAUEffectPreset(for app: AudioApp, entryID: UUID, presetData: Data?) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         if let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].presetData = presetData
             state.entries[idx].selectedFactoryPresetIndex = nil
@@ -849,7 +867,7 @@ final class AudioEngine {
     }
 
     func selectAUFactoryPreset(for app: AudioApp, entryID: UUID, presetIndex: Int) {
-        var state = appAU[app.persistenceIdentifier] ?? AUChainState()
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
         if let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].selectedFactoryPresetIndex = presetIndex >= 0 ? presetIndex : nil
             state.entries[idx].presetData = nil
@@ -903,15 +921,43 @@ final class AudioEngine {
         return host.factoryPresets
     }
 
-    private func commitAppAU(_ state: AUChainState, for app: AudioApp) {
+    private func commitAppAU(_ state: AUChainState, for app: AudioApp, onCommitted: @escaping @MainActor @Sendable () -> Void = {}) {
         let id = app.persistenceIdentifier
-        appAU[id] = state.entries.isEmpty ? nil : state
-        settingsManager.setAUEffectChain(state.entries, for: id)
-        taps[app.id]?.updateAUEffectChain(state.entries)
-        if state.isBypassed {
-            taps[app.id]?.setAUChainBypassed(true)
+        if pendingAppAU[id] != nil {
+            logger.warning("Superseding pending app AU update for \(id, privacy: .public)")
         }
-        syncAppAUFailedIDs(for: app)
+        let token = UUID()
+        pendingAppAU[id] = PendingAppAURequest(token: token, state: state)
+        guard let tap = taps[app.id] else {
+            finishAppAUUpdate(token: token, app: app, result: .committed, onCommitted: onCommitted)
+            return
+        }
+        tap.updateAUEffectChain(state.entries) { [weak self] result in
+            self?.finishAppAUUpdate(token: token, app: app, result: result, onCommitted: onCommitted)
+        }
+    }
+
+    private func finishAppAUUpdate(
+        token: UUID,
+        app: AudioApp,
+        result: AUChainUpdateResult,
+        onCommitted: @escaping @MainActor @Sendable () -> Void
+    ) {
+        let id = app.persistenceIdentifier
+        guard let request = pendingAppAU[id], request.token == token else { return }
+        pendingAppAU.removeValue(forKey: id)
+        switch result {
+        case .committed:
+            appAU[id] = request.state.entries.isEmpty ? nil : request.state
+            settingsManager.setAUEffectChain(request.state.entries, for: id)
+            if request.state.isBypassed {
+                taps[app.id]?.setAUChainBypassed(true)
+            }
+            syncAppAUFailedIDs(for: app)
+            onCommitted()
+        case .rejected, .superseded:
+            logger.warning("App AU update rejected for \(id, privacy: .public); retaining the previous chain and settings")
+        }
     }
 
     private func syncAppAUFailedIDs(for app: AudioApp) {
@@ -925,20 +971,21 @@ final class AudioEngine {
     // MARK: - Per-Device AU Effect Chains
 
     func addDeviceAUEffect(deviceUID: String, plugin: AUPluginDescriptor) {
-        var state = deviceAU[deviceUID] ?? AUChainState()
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
         state.entries.append(AUEffectChainEntry(plugin: plugin))
         commitDeviceAU(state, for: deviceUID)
     }
 
     func removeDeviceAUEffect(deviceUID: String, entryID: UUID) {
-        var state = deviceAU[deviceUID] ?? AUChainState()
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
         state.entries.removeAll { $0.id == entryID }
-        commitDeviceAU(state, for: deviceUID)
-        AUPluginWindowManager.shared.closeWindow(for: entryID)
+        commitDeviceAU(state, for: deviceUID) {
+            AUPluginWindowManager.shared.closeWindow(for: entryID, save: false)
+        }
     }
 
     func toggleDeviceAUEffect(deviceUID: String, entryID: UUID, enabled: Bool) {
-        var state = deviceAU[deviceUID] ?? AUChainState()
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
         if let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].isEnabled = enabled
         }
@@ -946,7 +993,7 @@ final class AudioEngine {
     }
 
     func reorderDeviceAUEffects(deviceUID: String, entries: [AUEffectChainEntry]) {
-        var state = deviceAU[deviceUID] ?? AUChainState()
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
         state.entries = entries
         commitDeviceAU(state, for: deviceUID)
     }
@@ -956,7 +1003,7 @@ final class AudioEngine {
     }
 
     func selectDeviceAUFactoryPreset(deviceUID: String, entryID: UUID, presetIndex: Int) {
-        var state = deviceAU[deviceUID] ?? AUChainState()
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
         if let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].selectedFactoryPresetIndex = presetIndex >= 0 ? presetIndex : nil
             state.entries[idx].presetData = nil
@@ -1012,16 +1059,73 @@ final class AudioEngine {
         deviceAU[deviceUID]?.isBypassed ?? false
     }
 
-    private func commitDeviceAU(_ state: AUChainState, for deviceUID: String) {
-        deviceAU[deviceUID] = state.entries.isEmpty ? nil : state
-        settingsManager.setDeviceAUEffectChain(state.entries, for: deviceUID)
-        applyDeviceAUChainToTaps(deviceUID: deviceUID, chain: state.entries)
-        if state.isBypassed {
+    private func commitDeviceAU(
+        _ state: AUChainState,
+        for deviceUID: String,
+        onCommitted: @escaping @MainActor @Sendable () -> Void = {}
+    ) {
+        if pendingDeviceAU[deviceUID] != nil {
+            logger.warning("Superseding pending device AU update for \(deviceUID, privacy: .public)")
+        }
+        let matchingTaps = taps.filter { $0.value.currentDeviceUIDs.contains(deviceUID) }
+        let token = UUID()
+        let previousEntries = deviceAU[deviceUID]?.entries ?? []
+        pendingDeviceAU[deviceUID] = PendingDeviceAURequest(
+            token: token,
+            state: state,
+            previousEntries: previousEntries,
+            expectedPIDs: Set(matchingTaps.map(\.key))
+        )
+        if matchingTaps.isEmpty {
+            finishDeviceAUUpdate(deviceUID: deviceUID, token: token, pid: nil, result: .committed, onCommitted: onCommitted)
+            return
+        }
+        for (pid, tap) in matchingTaps {
+            tap.updateDeviceAUEffectChain(state.entries) { [weak self] result in
+                self?.finishDeviceAUUpdate(deviceUID: deviceUID, token: token, pid: pid, result: result, onCommitted: onCommitted)
+            }
+        }
+    }
+
+    private func finishDeviceAUUpdate(
+        deviceUID: String,
+        token: UUID,
+        pid: pid_t?,
+        result: AUChainUpdateResult,
+        onCommitted: @escaping @MainActor @Sendable () -> Void
+    ) {
+        guard var request = pendingDeviceAU[deviceUID], request.token == token else { return }
+        if let pid {
+            request.completedPIDs.insert(pid)
+            if case .committed = result {
+                request.committedPIDs.insert(pid)
+            } else {
+                if !request.failed {
+                    logger.warning("Device AU update rejected for \(deviceUID, privacy: .public); retaining the previous chain on every tap")
+                }
+                request.failed = true
+            }
+        }
+
+        if request.failed {
+            for committedPID in request.committedPIDs {
+                taps[committedPID]?.updateDeviceAUEffectChain(request.previousEntries) { _ in }
+            }
+        }
+        pendingDeviceAU[deviceUID] = request
+        guard request.completedPIDs == request.expectedPIDs else { return }
+        pendingDeviceAU.removeValue(forKey: deviceUID)
+        guard !request.failed else { return }
+
+        deviceAU[deviceUID] = request.state.entries.isEmpty ? nil : request.state
+        settingsManager.setDeviceAUEffectChain(request.state.entries, for: deviceUID)
+        if request.state.isBypassed {
             for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
                 tap.setDeviceAUChainBypassed(true)
             }
         }
         syncDeviceAUFailedIDs(for: deviceUID)
+        onCommitted()
     }
 
     func saveAllLiveAUState() {
@@ -1146,14 +1250,16 @@ final class AudioEngine {
     private func applyDeviceAUChainToTap(_ tap: any ProcessTapControlling) {
         guard let deviceUID = tap.currentDeviceUID else { return }
         let chain = settingsManager.getDeviceAUEffectChain(for: deviceUID)
-        tap.updateDeviceAUEffectChain(chain)
-        if !chain.isEmpty {
-            deviceAU[deviceUID, default: AUChainState()].entries = chain
+        tap.updateDeviceAUEffectChain(chain) { [weak self] result in
+            guard let self, case .committed = result else { return }
+            if !chain.isEmpty {
+                self.deviceAU[deviceUID, default: AUChainState()].entries = chain
+            }
+            if self.deviceAU[deviceUID]?.isBypassed == true {
+                tap.setDeviceAUChainBypassed(true)
+            }
+            self.syncDeviceAUFailedIDs(for: deviceUID)
         }
-        if deviceAU[deviceUID]?.isBypassed == true {
-            tap.setDeviceAUChainBypassed(true)
-        }
-        syncDeviceAUFailedIDs(for: deviceUID)
     }
 
     private func applyAutoEQToTap(_ tap: any ProcessTapControlling) {
@@ -1558,15 +1664,19 @@ final class AudioEngine {
             // Load and apply persisted AU effect chains
             let savedAppAU = settingsManager.getAUEffectChain(for: app.persistenceIdentifier)
             if !savedAppAU.isEmpty {
-                tap.updateAUEffectChain(savedAppAU)
-                appAU[app.persistenceIdentifier, default: AUChainState()].entries = savedAppAU
-                syncAppAUFailedIDs(for: app)
+                tap.updateAUEffectChain(savedAppAU) { [weak self] result in
+                    guard let self, case .committed = result else { return }
+                    self.appAU[app.persistenceIdentifier, default: AUChainState()].entries = savedAppAU
+                    self.syncAppAUFailedIDs(for: app)
+                }
             }
             let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
             if !savedDeviceAU.isEmpty {
-                tap.updateDeviceAUEffectChain(savedDeviceAU)
-                deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
-                syncDeviceAUFailedIDs(for: deviceUID)
+                tap.updateDeviceAUEffectChain(savedDeviceAU) { [weak self] result in
+                    guard let self, case .committed = result else { return }
+                    self.deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
+                    self.syncDeviceAUFailedIDs(for: deviceUID)
+                }
             }
 
             loadPersistedAUBypassState(for: app, deviceUID: deviceUID)

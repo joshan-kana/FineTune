@@ -647,6 +647,59 @@ struct AUEffectChainTests {
         #expect(replacement.isEntryEnabled(enabledEntry.id) == false)
     }
 
+    @Test("Replacement preserves a newly requested factory preset")
+    func replacementPreservesRequestedFactoryPreset() {
+        let originalEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [originalEntry], sampleRate: 44100)
+        var requestedEntry = originalEntry
+        requestedEntry.selectedFactoryPresetIndex = 2
+        requestedEntry.presetData = nil
+
+        let replacement = AUEffectChain(
+            entries: [requestedEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.entries.first?.selectedFactoryPresetIndex == 2)
+        #expect(replacement.entries.first?.presetData == nil)
+    }
+
+    @Test("Replacement preserves explicitly supplied preset data")
+    func replacementPreservesExplicitPresetData() {
+        let originalEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [originalEntry], sampleRate: 44100)
+        var requestedEntry = originalEntry
+        requestedEntry.presetData = Data([0x11, 0x22, 0x33])
+        requestedEntry.selectedFactoryPresetIndex = nil
+
+        let replacement = AUEffectChain(
+            entries: [requestedEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.entries.first?.presetData == Data([0x11, 0x22, 0x33]))
+        #expect(replacement.entries.first?.selectedFactoryPresetIndex == nil)
+    }
+
+    @Test("Timed-out replacement retains the old chain and resumes after retirement cancellation")
+    func timedOutReplacementKeepsOldChainUsable() {
+        let oldEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let oldChain = AUEffectChain(entries: [oldEntry], sampleRate: 44100)
+        let oldEntries = oldChain.entries
+
+        #expect(oldChain.beginRenderForTesting())
+        let retirementToken = oldChain.beginRetirement()
+        #expect(oldChain.waitForRenderQuiescence(timeout: 0.001) == false)
+
+        oldChain.cancelRetirement(ifToken: retirementToken)
+        #expect(oldChain.entries == oldEntries)
+        #expect(oldChain.beginRenderForTesting())
+        oldChain.endRenderForTesting()
+        oldChain.endRenderForTesting()
+    }
+
     @Test("processInterleaved routes audio through chain")
     func processInterleavedWorks() {
         let desc = AUPluginDescriptor(

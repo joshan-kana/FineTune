@@ -22,6 +22,8 @@ final class RecordingProcessTapController: ProcessTapControlling {
         case setAutoEQPreampEnabled(Bool)
         case updateLoudnessCompensation(volume: Float, enabled: Bool)
         case updateLoudnessEqualization(LoudnessEqualizerSettings)
+        case updateAUEffectChain([AUEffectChainEntry])
+        case updateDeviceAUEffectChain([AUEffectChainEntry])
         case invalidate
     }
 
@@ -48,6 +50,12 @@ final class RecordingProcessTapController: ProcessTapControlling {
 
     let app: AudioApp
     private(set) var events: [Event] = []
+    var appAUResult: AUChainUpdateResult = .committed
+    var deviceAUResult: AUChainUpdateResult = .committed
+    var deferAUCompletions = false
+    private(set) var pendingAppAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
+    private(set) var pendingDeviceAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
+    private var lastAppAUCompletion: (@MainActor @Sendable (AUChainUpdateResult) -> Void)?
 
     // Mutable surface — recorded as plain property writes (not events).
     var volume: Float = 1.0
@@ -92,6 +100,49 @@ final class RecordingProcessTapController: ProcessTapControlling {
         events.append(.updateLoudnessEqualization(settings))
     }
 
+    func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        events.append(.updateAUEffectChain(entries))
+        lastAppAUCompletion = completion
+        if deferAUCompletions {
+            pendingAppAUCompletions.append(completion)
+        } else {
+            completion(appAUResult)
+        }
+    }
+
+    func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        events.append(.updateDeviceAUEffectChain(entries))
+        if deferAUCompletions {
+            pendingDeviceAUCompletions.append(completion)
+        } else {
+            completion(deviceAUResult)
+        }
+    }
+
+    func completeNextAppAU(_ result: AUChainUpdateResult) {
+        guard !pendingAppAUCompletions.isEmpty else { return }
+        pendingAppAUCompletions.removeFirst()(result)
+    }
+
+    func repeatLastAppAUCompletion(_ result: AUChainUpdateResult) {
+        lastAppAUCompletion?(result)
+    }
+
+    func completeNextDeviceAU(_ result: AUChainUpdateResult) {
+        guard !pendingDeviceAUCompletions.isEmpty else { return }
+        pendingDeviceAUCompletions.removeFirst()(result)
+    }
+
     func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws {
         currentDeviceUIDs = [newDeviceUID]
     }
@@ -127,6 +178,7 @@ private struct Fixture {
     let app: AudioApp
     let device: AudioDevice
     let lastTap: () -> RecordingProcessTapController?
+    let allTaps: () -> [RecordingProcessTapController]
 }
 
 @MainActor
@@ -182,6 +234,7 @@ private func makeFixture(
         tapFactory: { app, uids, _ in
             let tap = RecordingProcessTapController(app: app, deviceUIDs: uids)
             box.last = tap
+            box.all.append(tap)
             return tap
         },
         startMonitorsAutomatically: false
@@ -194,13 +247,15 @@ private func makeFixture(
         deviceVolume: mockVolume,
         app: app,
         device: device,
-        lastTap: { box.last }
+        lastTap: { box.last },
+        allTaps: { box.all }
     )
 }
 
 @MainActor
 private final class TapBox {
     var last: RecordingProcessTapController?
+    var all: [RecordingProcessTapController] = []
 }
 
 // MARK: - Suite
@@ -208,6 +263,148 @@ private final class TapBox {
 @Suite("AudioEngine.tapInitialState — first-sound fix (PR-1)")
 @MainActor
 struct AudioEngineTapInitialStateTests {
+
+    private func testPlugin() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+
+    private func secondTestApp() -> AudioApp {
+        AudioApp(
+            id: 12346,
+            processObjectIDs: [],
+            name: "SecondTestApp",
+            icon: NSImage(),
+            bundleID: "com.test.tapinitial.second"
+        )
+    }
+
+    @Test("App AU success publishes runtime, in-memory, and persisted state together")
+    func appAUCommitAfterSuccessfulHandoff() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+
+        fix.engine.addAUEffect(for: fix.app, plugin: testPlugin())
+
+        #expect(fix.engine.getAUEffectChain(for: fix.app).count == 1)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier).count == 1)
+        #expect(tap.events.contains { if case .updateAUEffectChain = $0 { return true }; return false })
+    }
+
+    @Test("App AU timeout retains the old chain and persisted entries")
+    func appAUTimeoutRetainsOldState() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+        fix.engine.addAUEffect(for: fix.app, plugin: testPlugin())
+        let oldEntries = fix.engine.getAUEffectChain(for: fix.app)
+        let entryID = try #require(oldEntries.first?.id)
+
+        tap.deferAUCompletions = true
+        fix.engine.selectAUFactoryPreset(for: fix.app, entryID: entryID, presetIndex: 2)
+        tap.completeNextAppAU(.rejected(reason: .timedOut))
+
+        #expect(fix.engine.getAUEffectChain(for: fix.app) == oldEntries)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier) == oldEntries)
+    }
+
+    @Test("A superseded app AU generation cannot publish over the newest request")
+    func supersededAppAURequestRetainsNewestState() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+        fix.engine.addAUEffect(for: fix.app, plugin: testPlugin())
+        let entryID = try #require(fix.engine.getAUEffectChain(for: fix.app).first?.id)
+
+        tap.deferAUCompletions = true
+        fix.engine.selectAUFactoryPreset(for: fix.app, entryID: entryID, presetIndex: 1)
+        fix.engine.selectAUFactoryPreset(for: fix.app, entryID: entryID, presetIndex: 2)
+        tap.completeNextAppAU(.committed)
+        #expect(fix.engine.getAUEffectChain(for: fix.app).first?.selectedFactoryPresetIndex == nil)
+        tap.completeNextAppAU(.committed)
+
+        #expect(fix.engine.getAUEffectChain(for: fix.app).first?.selectedFactoryPresetIndex == 2)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier).first?.selectedFactoryPresetIndex == 2)
+    }
+
+    @Test("All matching device taps publish one successful generation")
+    func deviceAUPairedSuccessPublishesAtomically() throws {
+        let fix = makeFixture()
+        let secondApp = secondTestApp()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        fix.engine.setDevice(for: secondApp, deviceUID: fix.device.uid)
+        let taps = fix.allTaps()
+        #expect(taps.count == 2)
+
+        fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: testPlugin())
+
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).count == 1)
+        #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid).count == 1)
+        #expect(taps.allSatisfy { tap in
+            tap.events.contains { if case .updateDeviceAUEffectChain = $0 { return true }; return false }
+        })
+    }
+
+    @Test("A device tap timeout rolls back successful peers without partial publication")
+    func deviceAUTapTimeoutRollsBackPeers() throws {
+        let fix = makeFixture()
+        let secondApp = secondTestApp()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        fix.engine.setDevice(for: secondApp, deviceUID: fix.device.uid)
+        let taps = fix.allTaps()
+        #expect(taps.count == 2)
+        fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: testPlugin())
+        let oldEntries = fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid)
+
+        taps.forEach { $0.deferAUCompletions = true }
+        fix.engine.removeDeviceAUEffect(deviceUID: fix.device.uid, entryID: try #require(oldEntries.first?.id))
+        taps[0].completeNextDeviceAU(.committed)
+        taps[1].completeNextDeviceAU(.rejected(reason: .timedOut))
+
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid) == oldEntries)
+        #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid) == oldEntries)
+        #expect(taps[0].events.contains { event in
+            if case .updateDeviceAUEffectChain(let entries) = event { return entries == oldEntries }
+            return false
+        })
+    }
+
+    @Test("Failed app AU removal retains the editor's chain state")
+    func failedAppAURemovalDoesNotCloseState() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+        fix.engine.addAUEffect(for: fix.app, plugin: testPlugin())
+        let oldEntries = fix.engine.getAUEffectChain(for: fix.app)
+
+        tap.deferAUCompletions = true
+        fix.engine.removeAUEffect(for: fix.app, entryID: try #require(oldEntries.first?.id))
+        tap.completeNextAppAU(.rejected(reason: .timedOut))
+
+        #expect(fix.engine.getAUEffectChain(for: fix.app) == oldEntries)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier) == oldEntries)
+    }
+
+    @Test("Repeated handoff completion cannot commit an app AU request twice")
+    func appAUCompletionIsConsumedOnce() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+
+        fix.engine.addAUEffect(for: fix.app, plugin: testPlugin())
+        let committed = fix.engine.getAUEffectChain(for: fix.app)
+        tap.repeatLastAppAUCompletion(.committed)
+
+        #expect(fix.engine.getAUEffectChain(for: fix.app) == committed)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier) == committed)
+    }
 
     // MARK: Single-knob derivation
 
@@ -390,7 +587,7 @@ struct AudioEngineTapInitialStateTests {
             case .updateEQSettings, .updateAutoEQProfile, .setAutoEQPreampEnabled,
                  .updateLoudnessCompensation, .updateLoudnessEqualization:
                 Issue.record("Pre-activate mutation breaks the apply-initial-state contract: \(event)")
-            case .activate, .invalidate:
+            case .activate, .invalidate, .updateAUEffectChain, .updateDeviceAUEffectChain:
                 break
             }
         }

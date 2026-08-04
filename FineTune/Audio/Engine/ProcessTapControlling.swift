@@ -6,6 +6,18 @@
 /// protocol; it reads `nonisolated(unsafe)` atomic fields directly on the concrete
 /// type via a `void *` userdata pointer.
 @MainActor
+enum AUChainUpdateRejection: Equatable, Sendable {
+    case timedOut
+}
+
+@MainActor
+enum AUChainUpdateResult: Equatable, Sendable {
+    case committed
+    case rejected(reason: AUChainUpdateRejection)
+    case superseded
+}
+
+@MainActor
 protocol ProcessTapControlling: AnyObject, Sendable {
     var app: AudioApp { get }
     var volume: Float { get set }
@@ -34,10 +46,18 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     func recreateForOutputRateChange() async throws
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry])
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    )
     func getAUEffectChainEntries() -> [AUEffectChainEntry]
     func setAUChainBypassed(_ bypassed: Bool)
     var isAUChainBypassed: Bool { get }
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry])
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    )
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry]
     func setDeviceAUChainBypassed(_ bypassed: Bool)
     var isDeviceAUChainBypassed: Bool { get }
@@ -74,10 +94,24 @@ extension ProcessTapControlling {
     }
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        updateAUEffectChain(entries)
+        completion(.committed)
+    }
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { [] }
     func setAUChainBypassed(_ bypassed: Bool) {}
     var isAUChainBypassed: Bool { false }
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        updateDeviceAUEffectChain(entries)
+        completion(.committed)
+    }
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { [] }
     func setDeviceAUChainBypassed(_ bypassed: Bool) {}
     var isDeviceAUChainBypassed: Bool { false }
