@@ -1,0 +1,40 @@
+name: Close resolved upstream conflict issue
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  close-issue:
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'automation/upstream-sync'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close only after exact merge confirmation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          merge_json="$(gh pr view "$EXPECTED_PR" --repo "$GITHUB_REPOSITORY" --json state,mergedAt,headRefName,headRefOid,mergeCommit)"
+          merged="$(jq -r '.state == "MERGED"' <<< "$merge_json")"
+          merged_at="$(jq -r '.mergedAt // ""' <<< "$merge_json")"
+          head_ref="$(jq -r '.headRefName' <<< "$merge_json")"
+          actual_head="$(jq -r '.headRefOid' <<< "$merge_json")"
+          merge_commit="$(jq -r '.mergeCommit.oid // ""' <<< "$merge_json")"
+          if [[ "$merged" != true || -z "$merged_at" || "$head_ref" != automation/upstream-sync || "$actual_head" != "$EXPECTED_HEAD" || -z "$merge_commit" ]]; then
+            echo 'merge confirmation did not match the exact automation PR/head; leaving issue open'
+            exit 0
+          fi
+
+          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search '"Upstream sync requires manual resolution" in:title' --json number --jq '.[0].number // empty')"
+          if [[ -n "$issue_number" ]]; then
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Closed after PR #$EXPECTED_PR merged at $merged_at with head $EXPECTED_HEAD as merge commit $merge_commit."
+          fi

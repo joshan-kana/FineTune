@@ -11,11 +11,14 @@ mkdir_build_dirs
 result_bundle="$RESULTS_ROOT/tests-$(date +%Y%m%d-%H%M%S).xcresult"
 log_file="$LOG_ROOT/test-$(date +%Y%m%d-%H%M%S).log"
 info "running FineTune tests"
+export SWIFTPM_DISABLE_SANDBOX=1
+export IDEPackageSupportDisableManifestSandbox=YES
 set +e
 xcodebuild test -project "$(project_file)" -scheme "$(scheme_name)" -destination 'platform=macOS' \
     -parallel-testing-enabled NO \
     -derivedDataPath "$DERIVED_DATA" -resultBundlePath "$result_bundle" \
-    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tee "$log_file"
+    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+    IDEPackageSupportDisableManifestSandbox=YES 2>&1 | tee "$log_file"
 status=${PIPESTATUS[0]}
 set -e
 if ((status != 0)); then

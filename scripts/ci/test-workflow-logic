@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+source "$SCRIPT_DIR/workflow-logic.sh"
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/finetune-workflow-test.XXXXXX")"
+trap 'rm -r -- "$tmp_dir"' EXIT
+
+assert() {
+    if ! "$@"; then
+        printf 'assertion failed: %s\n' "$*" >&2
+        exit 1
+    fi
+}
+
+git init -q "$tmp_dir/repo"
+cd "$tmp_dir/repo"
+git config user.name test
+git config user.email test@example.invalid
+printf 'base\n' >README
+git add README
+git commit -qm base
+git branch -M fork
+git branch upstream
+
+# No-op syncs do not create or update a PR.
+assert test "$(upstream_delta_count fork upstream)" -eq 0
+if workflow_should_update_pr 0; then
+    printf 'no-op incorrectly requested a PR\n' >&2
+    exit 1
+fi
+
+# A changed upstream creates a candidate PR, and a no-ff merge preserves ancestry.
+git switch -q upstream
+printf 'upstream change\n' >>README
+git add README
+git commit -qm upstream-change
+assert test "$(upstream_delta_count fork upstream)" -eq 1
+assert workflow_should_update_pr 1
+git switch -q fork
+git merge --no-edit --no-ff upstream >/dev/null
+assert test "$(upstream_delta_count fork upstream)" -eq 0
+assert git merge-base --is-ancestor upstream fork
+
+# A real content conflict aborts before a synchronization branch can proceed.
+git switch -q -c conflict-upstream fork^1
+printf 'upstream conflict\n' >README
+git add README
+git commit -qm upstream-conflict
+git switch -q fork
+printf 'fork conflict\n' >README
+git add README
+git commit -qm fork-conflict
+if git merge --no-edit conflict-upstream >/dev/null 2>&1; then
+    printf 'conflicting upstream merge unexpectedly succeeded\n' >&2
+    exit 1
+fi
+git merge --abort
+
+# Exact-head and required-check guards reject changed heads and failed checks.
+assert workflow_merge_guard expected expected success
+if workflow_merge_guard expected changed success || workflow_merge_guard expected expected failure; then
+    printf 'unsafe merge guard accepted a changed head or failed check\n' >&2
+    exit 1
+fi
+
+# A missing Nix executable is a handled prerequisite failure, not an implicit bypass.
+empty_path="$tmp_dir/empty-bin"
+mkdir -p "$empty_path"
+if PATH="$empty_path" workflow_command_available nix; then
+    printf 'missing Nix was treated as available\n' >&2
+    exit 1
+fi
+
+# Conflict issues stay open until the exact PR/head is observed as merged.
+if workflow_should_close_conflict_issue false '' head head 42 42 ||
+    workflow_should_close_conflict_issue true '' head head 42 42 ||
+    workflow_should_close_conflict_issue true 2026-08-04T00:00:00Z head changed 42 42 ||
+    workflow_should_close_conflict_issue true 2026-08-04T00:00:00Z head head 42 43; then
+    printf 'conflict issue guard closed before exact merge confirmation\n' >&2
+    exit 1
+fi
+assert workflow_should_close_conflict_issue true 2026-08-04T00:00:00Z head head 42 42
+
+printf 'workflow logic tests passed\n'

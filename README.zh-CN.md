@@ -4,15 +4,14 @@
 
 为每一个 App 单独控制音量、把过轻的声音最高放大 4 倍、把音频路由到不同的扬声器，再用 EQ 和耳机曲线把声音调到自己喜欢的样子。常驻菜单栏，免费且开源。
 
-<a href="https://github.com/ronitsingh10/FineTune/releases/latest/download/FineTune.dmg"><img src="assets/download-badge.svg" alt="下载 macOS 版本" height="48"/></a>
+<a href="https://github.com/joshan-kana/FineTune/releases"><img src="assets/download-badge.svg" alt="Fork macOS 版本" height="48"/></a>
 
 <br clear="all"/>
 
 <p align="center">
-  <a href="https://github.com/ronitsingh10/FineTune/releases/latest"><img src="https://img.shields.io/github/v/release/ronitsingh10/FineTune?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="最新版本"></a>
-  <a href="https://github.com/ronitsingh10/FineTune/releases"><img src="https://img.shields.io/github/downloads/ronitsingh10/FineTune/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="下载量"></a>
+  <a href="https://github.com/joshan-kana/FineTune/releases"><img src="https://img.shields.io/github/v/release/joshan-kana/FineTune?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="Fork 版本"></a>
+  <a href="https://github.com/joshan-kana/FineTune/releases"><img src="https://img.shields.io/github/downloads/joshan-kana/FineTune/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="Fork 下载量"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-3a3a3c?style=for-the-badge&labelColor=1c1c1e" alt="许可证：GPL v3"></a>
-  <a href="https://ko-fi.com/ronitsingh10"><img src="https://img.shields.io/badge/Tip_on_Ko--fi-FF5E5B?style=for-the-badge&labelColor=1c1c1e&logo=ko-fi&logoColor=white" alt="在 Ko-fi 打赏"></a>
   <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-15%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 15+"></a>
 </p>
 
@@ -32,13 +31,17 @@
 
 ## 安装
 
-**Homebrew**（推荐）
+**Nix**（推荐）
 
 ```bash
-brew install --cask finetune
+git clone https://github.com/joshan-kana/FineTune.git
+cd FineTune
+direnv allow
+nix run .#doctor
+nix run .#install
 ```
 
-**手动安装** —— [下载最新版本](https://github.com/ronitsingh10/FineTune/releases/latest)
+**Fork 发布版** —— [浏览已发布的安装包](https://github.com/joshan-kana/FineTune/releases)。发布包使用 ad-hoc 签名，未经过公证（notarization）。
 
 ## 快速上手
 
@@ -110,9 +113,11 @@ brew install --cask finetune
 ### 从源码构建
 
 ```bash
-git clone https://github.com/ronitsingh10/FineTune.git
+git clone https://github.com/joshan-kana/FineTune.git
 cd FineTune
-open FineTune.xcodeproj
+direnv allow
+nix run .#doctor
+nix run .#install
 ```
 
 ## 系统要求
@@ -120,11 +125,9 @@ open FineTune.xcodeproj
 - macOS 15.0 (Sequoia) 或更高版本
 - 音频采集权限（首次启动时弹出请求）
 
-## 支持作者
+## 项目
 
-FineTune 永远免费且开源。如果它让你的一天稍微轻松了一点，可以请作者喝杯咖啡 —— 但完全不必勉强 🙏
-
-[![请我喝咖啡](https://img.shields.io/badge/Buy_me_a_coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/ronitsingh10)
+FineTune 永远免费且开源。本仓库是基于 [上游 FineTune 项目](https://github.com/ronitsingh10/FineTune) 的维护分支；便携的 Audio Unit 工作会在源码和提交历史中保留署名。
 
 
 ## 许可证
