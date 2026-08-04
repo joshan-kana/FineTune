@@ -1131,6 +1131,36 @@ final class ProcessTapController: ProcessTapControlling {
         }
         _lastLoudnessVolume = initial.loudnessVolume
 
+        // Publish persisted AU chains before AudioDeviceStart. The first HAL callback
+        // must observe the complete processing graph, just like it observes the
+        // initialized EQ and loudness processors above.
+        let initialAUFormat = currentAUFormat()
+        if !initial.appAUEffectChain.isEmpty {
+            let chain = AUEffectChain(
+                entries: initial.appAUEffectChain,
+                sampleRate: initialAUFormat.sampleRate,
+                format: initialAUFormat
+            )
+            chain.setBypassed(initial.appAUBypassed)
+            auEffectChain = chain
+        } else {
+            auEffectChain = nil
+        }
+        if !initial.deviceAUEffectChain.isEmpty {
+            let chain = AUEffectChain(
+                entries: initial.deviceAUEffectChain,
+                sampleRate: initialAUFormat.sampleRate,
+                format: initialAUFormat
+            )
+            chain.setBypassed(initial.deviceAUBypassed)
+            deviceAUEffectChain = chain
+        } else {
+            deviceAUEffectChain = nil
+        }
+        _currentAUEntries = initial.appAUEffectChain
+        _currentDeviceAUEntries = initial.deviceAUEffectChain
+        updateMaxTailTime()
+
         // Create IO proc with gain processing
         nextCallbackID += 1
         _primaryCallbackID = nextCallbackID
@@ -1507,9 +1537,11 @@ final class ProcessTapController: ProcessTapControlling {
 
         if !_currentAUEntries.isEmpty {
             secondaryAUEffectChain = AUEffectChain(entries: _currentAUEntries, sampleRate: sampleRate, format: currentAUFormat())
+            secondaryAUEffectChain?.setBypassed(auEffectChain?.isBypassed == true)
         }
         if !_currentDeviceAUEntries.isEmpty {
             secondaryDeviceAUEffectChain = AUEffectChain(entries: _currentDeviceAUEntries, sampleRate: sampleRate, format: currentAUFormat())
+            secondaryDeviceAUEffectChain?.setBypassed(deviceAUEffectChain?.isBypassed == true)
         }
 
         nextCallbackID += 1
@@ -1750,11 +1782,13 @@ final class ProcessTapController: ProcessTapControlling {
             if !_currentAUEntries.isEmpty {
                 let oldChain = auEffectChain
                 auEffectChain = AUEffectChain(entries: _currentAUEntries, sampleRate: deviceSampleRate, format: format)
+                auEffectChain?.setBypassed(oldChain?.isBypassed == true)
                 if let oldChain { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldChain } }
             }
             if !_currentDeviceAUEntries.isEmpty {
                 let oldChain = deviceAUEffectChain
                 deviceAUEffectChain = AUEffectChain(entries: _currentDeviceAUEntries, sampleRate: deviceSampleRate, format: format)
+                deviceAUEffectChain?.setBypassed(oldChain?.isBypassed == true)
                 if let oldChain { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldChain } }
             }
             updateMaxTailTime()
