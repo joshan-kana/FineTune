@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Semantic version tag to publish, for example v1.9.0-jk.1'
+        required: true
+        type: string
   push:
     tags: ['v*']
 
@@ -13,22 +18,54 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
-      - name: Build, test, and package
-        run: |
-          nix run .#check
-          nix run .#package
-      - name: Publish GitHub release
+      - name: Validate selected tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          gh release create "$tag" dist/*.dmg dist/*.zip dist/SHA256SUMS dist/build-metadata.json --generate-notes --title "$tag"
+          tag="$RELEASE_TAG"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          }
+          if git show-ref --tags --verify --quiet "refs/tags/$tag"; then
+            target="$(git rev-list -n1 "$tag")"
+            [[ "$target" == "$GITHUB_SHA" ]] || {
+              echo "$tag points to $target, not selected commit $GITHUB_SHA" >&2
+              exit 1
+            }
+          else
+            echo "tag $tag will be created by the release API at $GITHUB_SHA"
+          fi
+      - name: Build, test, and package
+        run: |
+          nix run .#check
+          nix run .#package
+      - name: Publish or replace GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          notes='FineTune fork release. Artifacts are ad-hoc signed and are not notarized.'
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+              dist/*.dmg dist/*.zip dist/SHA256SUMS dist/build-metadata.json --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "$notes"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              dist/*.dmg dist/*.zip dist/SHA256SUMS dist/build-metadata.json \
+              --title "$tag" --notes "$notes"
+          fi
       - name: Attest packaged artifacts
         uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4
         with:
