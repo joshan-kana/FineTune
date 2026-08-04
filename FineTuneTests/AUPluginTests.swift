@@ -204,6 +204,49 @@ struct AUPluginScannerTests {
 
 // MARK: - AUEffectHost Tests
 
+@Suite("AUChannelInfo capability matching")
+struct AUChannelCapabilityMatcherTests {
+    @Test("Apple wildcard and upper-bound semantics")
+    func documentedSemantics() {
+        #expect(AUChannelCapabilityMatcher.matches(input: 2, output: 2, requestedInput: 2, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: 2, output: 2, requestedInput: 2, requestedOutput: 6))
+
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -1, requestedInput: 6, requestedOutput: 6))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: -1, requestedInput: 6, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -2, requestedInput: 2, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -2, output: -1, requestedInput: 8, requestedOutput: 2))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: 2, requestedInput: 6, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: 2, requestedInput: 6, requestedOutput: 6))
+        #expect(AUChannelCapabilityMatcher.matches(input: 2, output: -1, requestedInput: 2, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -3, requestedInput: 8, requestedOutput: 3))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: -3, requestedInput: 8, requestedOutput: 4))
+        #expect(AUChannelCapabilityMatcher.matches(input: -4, output: -8, requestedInput: 4, requestedOutput: 8))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -4, output: -8, requestedInput: 5, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: 0, output: 2, requestedInput: 0, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: 0, output: 2, requestedInput: 2, requestedOutput: 2))
+    }
+
+    @Test("Native layout counts distinguish mono, stereo, 5.1, and 7.1")
+    func commonLayouts() {
+        let capability = (input: -1, output: -3)
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 1, requestedOutput: 1))
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 2, requestedOutput: 2))
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 6, requestedOutput: 6) == false)
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 6, requestedOutput: 6))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 8, requestedOutput: 8))
+    }
+}
+
+@Suite("Audio Unit chain topology")
+struct AUEffectChainTopologyTests {
+    @Test("Parallel hosts use maximum and serial entries use sum")
+    func parallelThenSerial() {
+        #expect(AUEffectChainTopology.parallelMaximum([0.01, 0.04, 0.02]) == 0.04)
+        #expect(AUEffectChainTopology.serialSum([[0.01, 0.04], [0.02], [0.08, 0.03]], enabled: [true, false, true]) == 0.12)
+        #expect(AUEffectChainTopology.serialSum([[0.01], [0.02]], enabled: [false, false]) == 0)
+    }
+}
+
 @Suite("AUEffectHost")
 struct AUEffectHostTests {
 
@@ -498,7 +541,7 @@ struct AUEffectChainTests {
         )
 
         #expect(replacement.host(for: enabledEntry.id) === original.host(for: enabledEntry.id))
-        #expect(replacement.host(for: enabledEntry.id)?.isEnabled == false)
+        #expect(replacement.isEntryEnabled(enabledEntry.id) == false)
     }
 
     @Test("processInterleaved routes audio through chain")
