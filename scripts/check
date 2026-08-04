@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 ensure_repo
 "$SCRIPT_DIR/lint"
+"$SCRIPT_DIR/ci/test-workflow-logic"
 if command -v nix >/dev/null 2>&1; then nix flake check --no-build "$REPO_ROOT"; fi
 "$SCRIPT_DIR/doctor" || die "doctor reported a blocking prerequisite"
 "$SCRIPT_DIR/test"

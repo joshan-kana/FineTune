@@ -23,6 +23,8 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ github.token }}
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
       - name: Update and validate one lock-file PR
         id: update
         env:
@@ -52,8 +54,13 @@ jobs:
             gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" \
               --body 'Automated pinned-input update; upstream source synchronization is intentionally separate.'
           fi
-          echo "no_op=false" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          expected_head="$(git rev-parse HEAD)"
+          actual_head="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          [[ "$expected_head" == "$actual_head" ]]
+          {
+            echo "no_op=false"
+            echo "pr_number=$pr_number"
+          } >> "$GITHUB_OUTPUT"
       - name: Trigger required CI explicitly
         if: steps.update.outputs.no_op == 'false'
         env:

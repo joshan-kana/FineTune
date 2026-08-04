@@ -30,11 +30,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          source scripts/ci/workflow-logic.sh
           git remote add upstream https://github.com/ronitsingh10/FineTune.git
           git fetch origin main
           git fetch upstream main
 
-          delta_count="$(git rev-list --count origin/main..upstream/main)"
+          delta_count="$(upstream_delta_count origin/main upstream/main)"
           echo "upstream commits not in fork: $delta_count"
           if [[ "$delta_count" == 0 ]]; then
             echo "no_op=true" >> "$GITHUB_OUTPUT"
@@ -55,30 +56,30 @@ jobs:
           fi
 
           git push --force-with-lease origin HEAD:automation/upstream-sync
-          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head automation/upstream-sync --json number --jq '.[0].number // empty')"
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main --head automation/upstream-sync --json number --jq '.[0].number // empty')"
           if [[ -z "$pr_number" ]]; then
             pr_number="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head automation/upstream-sync \
               --title 'chore: synchronize upstream/main' \
               --body 'Automated upstream synchronization. Attribution and fork-specific changes remain reviewable in this PR.' \
               --json number --jq .number)"
-          else
-            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" \
-              --body 'Automated upstream synchronization. Attribution and fork-specific changes remain reviewable in this PR.'
           fi
-          echo "no_op=false" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          expected_head="$(git rev-parse HEAD)"
+          actual_head="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          workflow_merge_guard "$expected_head" "$actual_head" success
+          {
+            echo "no_op=false"
+            echo "pr_number=$pr_number"
+            echo "head=$expected_head"
+          } >> "$GITHUB_OUTPUT"
       - name: Trigger required CI explicitly
         if: steps.sync.outputs.no_op == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref automation/upstream-sync
-      - name: Enable guarded auto-merge and close stale conflict issue
+      - name: Enable guarded merge commit
         if: steps.sync.outputs.no_op == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh pr merge "${{ steps.sync.outputs.pr_number }}" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
-          while read -r issue_number; do
-            [[ -z "$issue_number" ]] || gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY" --comment 'A later upstream synchronization completed successfully.'
-          done < <(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search '"Upstream sync requires manual resolution" in:title' --json number --jq '.[].number')
+          gh pr merge "${{ steps.sync.outputs.pr_number }}" --repo "$GITHUB_REPOSITORY" --auto --merge --delete-branch
