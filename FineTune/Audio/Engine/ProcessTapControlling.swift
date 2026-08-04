@@ -5,6 +5,87 @@
 /// CoreAudio HAL I/O thread, but the audio callback never goes through this
 /// protocol; it reads `nonisolated(unsafe)` atomic fields directly on the concrete
 /// type via a `void *` userdata pointer.
+import Foundation
+
+@MainActor
+enum AUChainUpdateRejection: Equatable, Sendable {
+    case timedOut
+}
+
+@MainActor
+enum AUChainUpdateResult: Equatable, Sendable {
+    case committed
+    case rejected(reason: AUChainUpdateRejection)
+    case superseded
+}
+
+@MainActor
+enum AUChainPreparationResult: Sendable {
+    case prepared(AUChainPreparedToken)
+    case rejected(reason: AUChainUpdateRejection)
+    case superseded
+}
+
+/// A prepared AU replacement is inert until its owner claims and commits it.
+/// The coordinator can therefore abort prepared replacements without publishing
+/// a temporary generation or sending a compensating runtime update.
+@MainActor
+class AUChainPreparedToken: @unchecked Sendable {
+    enum Lifecycle {
+        case prepared
+        case commitClaimed
+        case committed
+        case aborted
+    }
+
+    let tokenID: UUID
+    let requestGeneration: UInt64
+    let tapIdentity: UUID
+    let previousEntries: [AUEffectChainEntry]
+    let currentEntries: [AUEffectChainEntry]
+    let expiresAt: Date
+    private(set) var lifecycle: Lifecycle = .prepared
+
+    init(
+        tokenID: UUID = UUID(),
+        requestGeneration: UInt64,
+        tapIdentity: UUID,
+        previousEntries: [AUEffectChainEntry],
+        currentEntries: [AUEffectChainEntry],
+        expiresAt: Date = Date().addingTimeInterval(1)
+    ) {
+        self.tokenID = tokenID
+        self.requestGeneration = requestGeneration
+        self.tapIdentity = tapIdentity
+        self.previousEntries = previousEntries
+        self.currentEntries = currentEntries
+        self.expiresAt = expiresAt
+    }
+
+    func claimCommit(tapIdentity: UUID, requestGeneration: UInt64, now: Date = Date()) -> Bool {
+        guard lifecycle == .prepared,
+              self.tapIdentity == tapIdentity,
+              self.requestGeneration == requestGeneration,
+              now < expiresAt else { return false }
+        lifecycle = .commitClaimed
+        return true
+    }
+
+    @discardableResult
+    func finishCommit() -> Bool {
+        guard lifecycle == .commitClaimed else { return false }
+        lifecycle = .committed
+        return true
+    }
+
+    @discardableResult
+    func abort() -> Bool {
+        guard lifecycle != .committed, lifecycle != .aborted else { return false }
+        lifecycle = .aborted
+        return true
+    }
+}
+
 @MainActor
 protocol ProcessTapControlling: AnyObject, Sendable {
     var app: AudioApp { get }
@@ -30,14 +111,31 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     func isHealthCheckEligible(minActiveSeconds: Double) -> Bool
 
     var tapSourceDeviceUID: String? { get }
+    var auTransactionOwnerID: UUID { get }
     func refreshTapSource(_ preferredDeviceUID: String?) async throws
     func recreateForOutputRateChange() async throws
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry])
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    )
     func getAUEffectChainEntries() -> [AUEffectChainEntry]
     func setAUChainBypassed(_ bypassed: Bool)
     var isAUChainBypassed: Bool { get }
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry])
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    )
+    func prepareDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        requestGeneration: UInt64,
+        completion: @escaping @MainActor @Sendable (AUChainPreparationResult) -> Void
+    )
+    func claimPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken, requestGeneration: UInt64) -> Bool
+    func commitClaimedDeviceAUEffectChain(_ token: AUChainPreparedToken)
+    func abortPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken)
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry]
     func setDeviceAUChainBypassed(_ bypassed: Bool)
     var isDeviceAUChainBypassed: Bool { get }
@@ -74,10 +172,46 @@ extension ProcessTapControlling {
     }
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+    func updateAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        updateAUEffectChain(entries)
+        completion(.committed)
+    }
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { [] }
     func setAUChainBypassed(_ bypassed: Bool) {}
     var isAUChainBypassed: Bool { false }
     func updateDeviceAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+    func updateDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        completion: @escaping @MainActor @Sendable (AUChainUpdateResult) -> Void
+    ) {
+        updateDeviceAUEffectChain(entries)
+        completion(.committed)
+    }
+    func prepareDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        requestGeneration: UInt64,
+        completion: @escaping @MainActor @Sendable (AUChainPreparationResult) -> Void
+    ) {
+        let token = AUChainPreparedToken(
+            requestGeneration: requestGeneration,
+            tapIdentity: auTransactionOwnerID,
+            previousEntries: getDeviceAUEffectChainEntries(),
+            currentEntries: entries
+        )
+        completion(.prepared(token))
+    }
+    func claimPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken, requestGeneration: UInt64) -> Bool {
+        token.claimCommit(tapIdentity: auTransactionOwnerID, requestGeneration: requestGeneration)
+    }
+    func commitClaimedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        _ = token.finishCommit()
+    }
+    func abortPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        _ = token.abort()
+    }
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { [] }
     func setDeviceAUChainBypassed(_ bypassed: Bool) {}
     var isDeviceAUChainBypassed: Bool { false }

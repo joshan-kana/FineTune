@@ -39,6 +39,32 @@ enum AUChannelSelection: String, Codable, CaseIterable, Sendable {
     case custom
 }
 
+/// Implements the channel-count rules documented for AUChannelInfo.
+///
+/// -1 and -2 mean an unconstrained count, but they differ when paired:
+/// {-1, -1} requires matching counts while {-1, -2} and {-2, -1} do not.
+/// Values less than -2 are upper bounds across the scope's buses. Zero means
+/// that the corresponding side has no elements.
+enum AUChannelCapabilityMatcher {
+    static func matches(input: Int, output: Int, requestedInput: Int, requestedOutput: Int) -> Bool {
+        guard requestedInput >= 0, requestedOutput >= 0 else { return false }
+        if input == -1, output == -1, requestedInput != requestedOutput { return false }
+        return matches(count: input, requested: requestedInput) &&
+            matches(count: output, requested: requestedOutput)
+    }
+
+    static func matches(count: Int, requested: Int) -> Bool {
+        switch count {
+        case -1, -2:
+            return true
+        case ...(-3):
+            return requested <= abs(count)
+        default:
+            return count == requested
+        }
+    }
+}
+
 /// Immutable description of one audio render format.
 ///
 /// This is deliberately independent of an `AudioBufferList`; a buffer list is

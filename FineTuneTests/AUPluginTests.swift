@@ -1,7 +1,110 @@
 // FineTuneTests/AUPluginTests.swift
 import AudioToolbox
+import Foundation
 import Testing
 @testable import FineTune
+
+// MARK: - Render handoff tests
+
+@Suite("AU render handoff", .serialized)
+struct AUEffectRenderHandoffTests {
+
+    @Test("Normal completion reaches quiescence")
+    func normalCompletion() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        handoff.endRender()
+
+        _ = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.01))
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Delayed render completion is bounded and eventually safe")
+    func delayedCompletion() {
+        let handoff = AUEffectRenderHandoff()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        #expect(handoff.beginRender())
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 1)
+            handoff.endRender()
+        }
+        #expect(entered.wait(timeout: .now() + 1) == .success)
+
+        _ = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.001) == false)
+        release.signal()
+        #expect(handoff.waitForQuiescence(timeout: 0.5))
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Timeout can be cancelled without destroying an active render")
+    func timeoutCancellation() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        let token = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.001) == false)
+
+        handoff.cancelRetirement(ifToken: token)
+        #expect(handoff.beginRender())
+        handoff.endRender()
+        handoff.endRender()
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Retired snapshot rejects new renders until quiescent")
+    func noConcurrentReuse() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        let token = handoff.beginRetirement()
+        #expect(handoff.beginRender() == false)
+        handoff.endRender()
+        #expect(handoff.waitForQuiescence(timeout: 0.01))
+
+        handoff.cancelRetirement(ifToken: token)
+        #expect(handoff.beginRender())
+        handoff.endRender()
+    }
+}
+
+@Suite("AU publication transaction")
+struct AUEffectChainPublicationTransactionTests {
+
+    @Test("Paired success publishes one generation")
+    func pairedSuccess() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(true)
+        #expect(transaction.canPublish(for: 7))
+    }
+
+    @Test("Primary success and secondary timeout do not publish")
+    func secondaryTimeout() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(false)
+        #expect(!transaction.canPublish(for: 7))
+    }
+
+    @Test("Both timed-out handoffs do not publish")
+    func bothTimeout() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(false)
+        transaction.recordSecondary(false)
+        #expect(!transaction.canPublish(for: 7))
+    }
+
+    @Test("A superseded generation cannot publish")
+    func supersededGeneration() {
+        var transaction = AUEffectChainPublicationTransaction(generation: 7, requiresSecondary: true)
+        transaction.recordPrimary(true)
+        transaction.recordSecondary(true)
+        #expect(!transaction.canPublish(for: 8))
+    }
+}
 
 // MARK: - AUPluginDescriptor Tests
 
@@ -203,6 +306,49 @@ struct AUPluginScannerTests {
 }
 
 // MARK: - AUEffectHost Tests
+
+@Suite("AUChannelInfo capability matching")
+struct AUChannelCapabilityMatcherTests {
+    @Test("Apple wildcard and upper-bound semantics")
+    func documentedSemantics() {
+        #expect(AUChannelCapabilityMatcher.matches(input: 2, output: 2, requestedInput: 2, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: 2, output: 2, requestedInput: 2, requestedOutput: 6))
+
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -1, requestedInput: 6, requestedOutput: 6))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: -1, requestedInput: 6, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -2, requestedInput: 2, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -2, output: -1, requestedInput: 8, requestedOutput: 2))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: 2, requestedInput: 6, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: 2, requestedInput: 6, requestedOutput: 6))
+        #expect(AUChannelCapabilityMatcher.matches(input: 2, output: -1, requestedInput: 2, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -3, requestedInput: 8, requestedOutput: 3))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -1, output: -3, requestedInput: 8, requestedOutput: 4))
+        #expect(AUChannelCapabilityMatcher.matches(input: -4, output: -8, requestedInput: 4, requestedOutput: 8))
+        #expect(!AUChannelCapabilityMatcher.matches(input: -4, output: -8, requestedInput: 5, requestedOutput: 8))
+        #expect(AUChannelCapabilityMatcher.matches(input: 0, output: 2, requestedInput: 0, requestedOutput: 2))
+        #expect(!AUChannelCapabilityMatcher.matches(input: 0, output: 2, requestedInput: 2, requestedOutput: 2))
+    }
+
+    @Test("Native layout counts distinguish mono, stereo, 5.1, and 7.1")
+    func commonLayouts() {
+        let capability = (input: -1, output: -3)
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 1, requestedOutput: 1))
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 2, requestedOutput: 2))
+        #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 6, requestedOutput: 6) == false)
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 6, requestedOutput: 6))
+        #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 8, requestedOutput: 8))
+    }
+}
+
+@Suite("Audio Unit chain topology")
+struct AUEffectChainTopologyTests {
+    @Test("Parallel hosts use maximum and serial entries use sum")
+    func parallelThenSerial() {
+        #expect(AUEffectChainTopology.parallelMaximum([0.01, 0.04, 0.02]) == 0.04)
+        #expect(AUEffectChainTopology.serialSum([[0.01, 0.04], [0.02], [0.08, 0.03]], enabled: [true, false, true]) == 0.12)
+        #expect(AUEffectChainTopology.serialSum([[0.01], [0.02]], enabled: [false, false]) == 0)
+    }
+}
 
 @Suite("AUEffectHost")
 struct AUEffectHostTests {
@@ -498,7 +644,60 @@ struct AUEffectChainTests {
         )
 
         #expect(replacement.host(for: enabledEntry.id) === original.host(for: enabledEntry.id))
-        #expect(replacement.host(for: enabledEntry.id)?.isEnabled == false)
+        #expect(replacement.isEntryEnabled(enabledEntry.id) == false)
+    }
+
+    @Test("Replacement preserves a newly requested factory preset")
+    func replacementPreservesRequestedFactoryPreset() {
+        let originalEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [originalEntry], sampleRate: 44100)
+        var requestedEntry = originalEntry
+        requestedEntry.selectedFactoryPresetIndex = 2
+        requestedEntry.presetData = nil
+
+        let replacement = AUEffectChain(
+            entries: [requestedEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.entries.first?.selectedFactoryPresetIndex == 2)
+        #expect(replacement.entries.first?.presetData == nil)
+    }
+
+    @Test("Replacement preserves explicitly supplied preset data")
+    func replacementPreservesExplicitPresetData() {
+        let originalEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [originalEntry], sampleRate: 44100)
+        var requestedEntry = originalEntry
+        requestedEntry.presetData = Data([0x11, 0x22, 0x33])
+        requestedEntry.selectedFactoryPresetIndex = nil
+
+        let replacement = AUEffectChain(
+            entries: [requestedEntry],
+            sampleRate: 44100,
+            reusing: original
+        )
+
+        #expect(replacement.entries.first?.presetData == Data([0x11, 0x22, 0x33]))
+        #expect(replacement.entries.first?.selectedFactoryPresetIndex == nil)
+    }
+
+    @Test("Timed-out replacement retains the old chain and resumes after retirement cancellation")
+    func timedOutReplacementKeepsOldChainUsable() {
+        let oldEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        let oldChain = AUEffectChain(entries: [oldEntry], sampleRate: 44100)
+        let oldEntries = oldChain.entries
+
+        #expect(oldChain.beginRenderForTesting())
+        let retirementToken = oldChain.beginRetirement()
+        #expect(oldChain.waitForRenderQuiescence(timeout: 0.001) == false)
+
+        oldChain.cancelRetirement(ifToken: retirementToken)
+        #expect(oldChain.entries == oldEntries)
+        #expect(oldChain.beginRenderForTesting())
+        oldChain.endRenderForTesting()
+        oldChain.endRenderForTesting()
     }
 
     @Test("processInterleaved routes audio through chain")
@@ -547,6 +746,19 @@ struct AUEffectChainTests {
         #expect(energy < maxPossibleEnergy * 0.001, "15kHz should be nearly silent through 100Hz lowpass")
     }
 
+    @Test("Disabled reused group is not rendered")
+    func disabledGroupPassthrough() {
+        let entry = AUEffectChainEntry(plugin: appleLowPassFilter(), isEnabled: false)
+        let chain = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 64)
+        var buffer: [Float] = [0.5, -0.5, 0.25, -0.25]
+        let original = buffer
+        buffer.withUnsafeMutableBufferPointer { pointer in
+            chain.processInterleaved(samples: pointer.baseAddress!, frameCount: 2)
+        }
+        #expect(buffer == original)
+        #expect(chain.isEntryEnabled(entry.id) == false)
+    }
+
     @Test("Bypassed chain does not modify audio")
     func bypassedChainPassthrough() {
         let entry = AUEffectChainEntry(plugin: appleAUDelay())
@@ -561,6 +773,23 @@ struct AUEffectChainTests {
         #expect(buffer == original)
     }
 
+    @Test("Timed-out handoff preserves the old chain and resumes after cancellation")
+    func timedOutHandoffPreservesOldChain() {
+        let entry = AUEffectChainEntry(plugin: appleLowPassFilter())
+        let chain = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 256)
+        let originalEntries = chain.entries
+        #expect(chain.beginRenderForTesting())
+
+        let retirementToken = chain.beginRetirement()
+        #expect(chain.waitForRenderQuiescence(timeout: 0.001) == false)
+        chain.cancelRetirement(ifToken: retirementToken)
+        chain.endRenderForTesting()
+
+        #expect(chain.entries == originalEntries)
+        #expect(chain.beginRenderForTesting())
+        chain.endRenderForTesting()
+    }
+
     private func appleAUDelay() -> AUPluginDescriptor {
         AUPluginDescriptor(
             componentType: kAudioUnitType_Effect,
@@ -570,6 +799,252 @@ struct AUEffectChainTests {
             manufacturer: "Apple",
             version: 1
         )
+    }
+
+    private func appleLowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+}
+
+// MARK: - Peer registry tests
+
+@Suite("AU peer registry", .serialized)
+struct AUEffectPeerRegistryTests {
+
+    @Test("Shared hosts remain registered until every owner unregisters")
+    func ownerScopedCleanup() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let firstOwner = UUID()
+        let secondOwner = UUID()
+        let first = AUEffectHost(descriptor: appleAUDelay(), entryID: entryID, sampleRate: 44100)
+        let second = AUEffectHost(descriptor: appleAUDelay(), entryID: entryID, sampleRate: 44100)
+        #expect(first.instantiate())
+        #expect(second.instantiate())
+
+        registry.register([first], entryID: entryID, ownerID: firstOwner)
+        registry.register([first, second], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+
+        registry.unregisterSynchronouslyForTesting([first], entryID: entryID, ownerID: firstOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+        registry.unregisterSynchronouslyForTesting([first], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 1)
+        registry.unregisterSynchronouslyForTesting([second], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 0)
+    }
+
+    @Test("Two independent mono hosts synchronize and exclude the source")
+    func independentMonoHostsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        let source = makeHost(entryID: entryID, format: format(channelCount: 1), mode: .independentPerChannel)
+        let peer = makeHost(entryID: entryID, format: format(channelCount: 1), mode: .independentPerChannel)
+        let callback = DispatchSemaphore(value: 0)
+        var peerUpdates = 0
+        var sourceUpdates = 0
+
+        source.setPeerParameterSetterForTesting { _ in
+            sourceUpdates += 1
+            return noErr
+        }
+        peer.setPeerParameterSetterForTesting { value in
+            peerUpdates += 1
+            callback.signal()
+            registry.emitParameterChangeForTesting(entryID: entryID, source: peer, parameterID: 7, value: value)
+            return noErr
+        }
+        registry.register([source, peer], entryID: entryID, ownerID: ownerID)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 7, value: 0.5)
+
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(peerUpdates == 1)
+        #expect(sourceUpdates == 0)
+        registry.unregisterSynchronouslyForTesting([source, peer], entryID: entryID, ownerID: ownerID)
+    }
+
+    @Test("5.1 and 7.1 host groups fan out to every independent host")
+    func multichannelHostGroupsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        #expect(synchronizeHostGroup(registry: registry, channelCount: 6, expectedPeers: 5))
+        #expect(synchronizeHostGroup(registry: registry, channelCount: 8, expectedPeers: 7))
+    }
+
+    @Test("Two simulated device tap groups share parameter peers")
+    func deviceTapGroupsSynchronize() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let firstOwner = UUID()
+        let secondOwner = UUID()
+        let firstGroup = [
+            makeHost(entryID: entryID, format: format(channelCount: 1)),
+            makeHost(entryID: entryID, format: format(channelCount: 1))
+        ]
+        let secondGroup = [
+            makeHost(entryID: entryID, format: format(channelCount: 1)),
+            makeHost(entryID: entryID, format: format(channelCount: 1))
+        ]
+        let callback = DispatchSemaphore(value: 0)
+        var updates = 0
+        for host in secondGroup {
+            host.setPeerParameterSetterForTesting { _ in
+                updates += 1
+                callback.signal()
+                return noErr
+            }
+        }
+
+        registry.register(firstGroup, entryID: entryID, ownerID: firstOwner)
+        registry.register(secondGroup, entryID: entryID, ownerID: secondOwner)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: firstGroup[0], parameterID: 3, value: 0.25)
+
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(updates == 2)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 4)
+        registry.unregisterSynchronouslyForTesting(firstGroup, entryID: entryID, ownerID: firstOwner)
+        registry.unregisterSynchronouslyForTesting(secondGroup, entryID: entryID, ownerID: secondOwner)
+    }
+
+    @Test("Failed peer updates clear suppression for the next source change")
+    func failedPeerUpdateClearsSuppression() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        let source = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let peer = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let callback = DispatchSemaphore(value: 0)
+        var shouldFail = true
+        var updates = 0
+        peer.setPeerParameterSetterForTesting { _ in
+            updates += 1
+            callback.signal()
+            return shouldFail ? -1 : noErr
+        }
+        registry.register([source, peer], entryID: entryID, ownerID: ownerID)
+
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 9, value: 0.75)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        shouldFail = false
+        registry.emitParameterChangeForTesting(entryID: entryID, source: source, parameterID: 9, value: 0.8)
+        #expect(callback.wait(timeout: .now() + 1) == .success)
+        #expect(updates == 2)
+        registry.unregisterSynchronouslyForTesting([source, peer], entryID: entryID, ownerID: ownerID)
+    }
+
+    @Test("Stale hosts are removed from peer groups")
+    func staleHostCleanup() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let ownerID = UUID()
+        var stale: AUEffectHost? = makeHost(entryID: entryID, format: format(channelCount: 1))
+        let live = makeHost(entryID: entryID, format: format(channelCount: 1))
+        registry.register([stale!, live], entryID: entryID, ownerID: ownerID)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+        stale = nil
+        #expect(registry.hostCountForTesting(entryID: entryID) == 1)
+        registry.unregisterSynchronouslyForTesting([live], entryID: entryID, ownerID: ownerID)
+    }
+
+    @Test("Failed preset load leaves the host available for rendering")
+    func failedPresetLoadContained() {
+        let host = AUEffectHost(descriptor: appleAUDelay(), entryID: UUID(), sampleRate: 44100)
+        #expect(host.instantiate())
+        #expect(host.loadPresetSafely(Data([0x00, 0x01, 0x02]), timeout: 0.01) == false)
+        #expect(host.audioUnit != nil)
+    }
+
+    private func appleAUDelay() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+
+    private func appleLowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+
+    private func makeHost(
+        entryID: UUID,
+        format: AudioStreamFormatDescription,
+        mode: AUProcessingMode = .auto
+    ) -> AUEffectHost {
+        AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: entryID,
+            sampleRate: format.sampleRate,
+            format: format,
+            processingMode: mode
+        )
+    }
+
+    private func format(channelCount: Int) -> AudioStreamFormatDescription {
+        let tag: AudioChannelLayoutTag?
+        switch channelCount {
+        case 1: tag = kAudioChannelLayoutTag_Mono
+        case 6: tag = kAudioChannelLayoutTag_AudioUnit_5_1
+        case 8: tag = kAudioChannelLayoutTag_AudioUnit_7_1
+        default: tag = nil
+        }
+        return AudioStreamFormatDescription(
+            sampleRate: 44100,
+            frameCapacity: 64,
+            channelCount: channelCount,
+            isInterleaved: false,
+            channelLayoutTag: tag
+        )
+    }
+
+    private func synchronizeHostGroup(
+        registry: AUEffectPeerRegistry,
+        channelCount: Int,
+        expectedPeers: Int
+    ) -> Bool {
+        let entryID = UUID()
+        let ownerID = UUID()
+        let hosts = (0..<channelCount).map { _ in
+            makeHost(entryID: entryID, format: format(channelCount: channelCount), mode: .independentPerChannel)
+        }
+        let callback = DispatchSemaphore(value: 0)
+        var updates = 0
+        for host in hosts.dropFirst() {
+            host.setPeerParameterSetterForTesting { _ in
+                updates += 1
+                callback.signal()
+                return noErr
+            }
+        }
+        registry.register(hosts, entryID: entryID, ownerID: ownerID)
+        registry.emitParameterChangeForTesting(entryID: entryID, source: hosts[0], parameterID: 11, value: 0.4)
+        for _ in 0..<expectedPeers {
+            guard callback.wait(timeout: .now() + 1) == .success else {
+                registry.unregisterSynchronouslyForTesting(hosts, entryID: entryID, ownerID: ownerID)
+                return false
+            }
+        }
+        let result = updates == expectedPeers && registry.hostCountForTesting(entryID: entryID) == channelCount
+        registry.unregisterSynchronouslyForTesting(hosts, entryID: entryID, ownerID: ownerID)
+        return result
     }
 }
 

@@ -2,6 +2,18 @@ import AudioToolbox
 import Foundation
 import os
 
+private func auPeerEventListener(
+    _ userData: UnsafeMutableRawPointer?,
+    _ object: UnsafeMutableRawPointer?,
+    _ event: UnsafePointer<AudioUnitEvent>,
+    _ hostTime: UInt64,
+    _ value: AudioUnitParameterValue
+) {
+    guard let userData, event.pointee.mEventType.rawValue == 0 else { return }
+    let host = Unmanaged<AUEffectHost>.fromOpaque(userData).takeUnretainedValue()
+    host.notifyParameterChange(event.pointee.mArgument.mParameter, value: value)
+}
+
 /// Real-time-safe host for one Audio Unit instance.
 ///
 /// Audio Units are prepared, negotiated, and initialized before the render
@@ -17,6 +29,10 @@ final class AUEffectHost: @unchecked Sendable {
     private nonisolated(unsafe) var _audioUnit: AudioUnit?
     private nonisolated(unsafe) var _isEnabled: Bool
     private nonisolated(unsafe) var _sampleTime: Float64 = 0
+    private var parameterListener: AUEventListenerRef?
+    private var parameterChangeHandler: ((AudioUnitParameter, AudioUnitParameterValue) -> Void)?
+    private var observedParameters: [AudioUnitParameter] = []
+    private let renderHandoff = AUEffectRenderHandoff()
 
     let _bufferCapacity: Int
     let _channelCapacity: Int
@@ -30,6 +46,8 @@ final class AUEffectHost: @unchecked Sendable {
     private(set) var latencySeconds: Double = 0
     private(set) var supportedChannelCounts: [(input: Int, output: Int)] = []
     private(set) var supportedLayoutTags: [AudioChannelLayoutTag] = []
+    private(set) var supportedInputLayoutTags: [AudioChannelLayoutTag] = []
+    private(set) var supportedOutputLayoutTags: [AudioChannelLayoutTag] = []
     private(set) var canProcessCurrentLayout = false
 
     private let logger: Logger
@@ -37,6 +55,18 @@ final class AUEffectHost: @unchecked Sendable {
 
     var isEnabled: Bool { _isEnabled }
     var audioUnit: AudioUnit? { _audioUnit }
+
+    #if DEBUG
+    private var peerParameterSetterForTesting: ((AudioUnitParameterValue) -> OSStatus)?
+
+    func setPeerParameterSetterForTesting(_ setter: ((AudioUnitParameterValue) -> OSStatus)?) {
+        peerParameterSetterForTesting = setter
+    }
+
+    func applyPeerParameterForTesting(_ value: AudioUnitParameterValue) -> OSStatus? {
+        peerParameterSetterForTesting?(value)
+    }
+    #endif
 
     var compatibilityDescription: String {
         guard canProcessCurrentLayout else {
@@ -98,6 +128,9 @@ final class AUEffectHost: @unchecked Sendable {
     }
 
     deinit {
+        if let parameterListener {
+            AUListenerDispose(parameterListener)
+        }
         if let au = _audioUnit {
             AudioUnitUninitialize(au)
             AudioComponentInstanceDispose(au)
@@ -129,20 +162,24 @@ final class AUEffectHost: @unchecked Sendable {
         }
 
         supportedChannelCounts = querySupportedChannelCounts(au)
-        supportedLayoutTags = querySupportedLayoutTags(au)
-        canProcessCurrentLayout = supportsCurrentLayout
+        let layoutTags = querySupportedLayoutTags(au)
+        supportedInputLayoutTags = layoutTags.input
+        supportedOutputLayoutTags = layoutTags.output
+        supportedLayoutTags = Array(Set(layoutTags.input + layoutTags.output))
+
+        var negotiationSucceeded = supportsCurrentLayout
         if processingMode == .bypassForLayout {
-            canProcessCurrentLayout = false
+            negotiationSucceeded = false
         }
 
         // A stereo-only mode never attempts an implicit multichannel downmix.
         if processingMode == .stereoOnly && format.channelCount != 2 {
-            canProcessCurrentLayout = false
+            negotiationSucceeded = false
         }
 
         // Apple effects are hosted with non-interleaved Float32 buffers. The
         // source stream's interleaving is converted in preallocated memory.
-        var streamFormat = AudioStreamFormatDescription(
+        let streamFormat = AudioStreamFormatDescription(
             sampleRate: format.sampleRate,
             frameCapacity: format.frameCapacity,
             channelCount: format.channelCount,
@@ -150,19 +187,19 @@ final class AUEffectHost: @unchecked Sendable {
             channelLayoutTag: format.channelLayoutTag
         ).audioStreamBasicDescription
 
-        err = AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &streamFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-        if err != noErr { logger.warning("Failed to set input stream format: \(err)") }
-        err = AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &streamFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-        if err != noErr { logger.warning("Failed to set output stream format: \(err)") }
+        err = setAndVerifyStreamFormat(au, streamFormat, scope: kAudioUnitScope_Input)
+        if err != noErr { logger.warning("Failed to negotiate input stream format: \(err)"); negotiationSucceeded = false }
+        err = setAndVerifyStreamFormat(au, streamFormat, scope: kAudioUnitScope_Output)
+        if err != noErr { logger.warning("Failed to negotiate output stream format: \(err)"); negotiationSucceeded = false }
 
         if var layout = format.audioUnitLayout() {
-            _ = withUnsafePointer(to: &layout) { layoutPtr in
-                AudioUnitSetProperty(au, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0, layoutPtr, UInt32(MemoryLayout<AudioChannelLayout>.size))
-            }
-            _ = withUnsafePointer(to: &layout) { layoutPtr in
-                AudioUnitSetProperty(au, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Output, 0, layoutPtr, UInt32(MemoryLayout<AudioChannelLayout>.size))
-            }
+            err = setAndVerifyLayout(au, &layout, scope: kAudioUnitScope_Input)
+            if err != noErr { logger.warning("Failed to negotiate input channel layout: \(err)"); negotiationSucceeded = false }
+            err = setAndVerifyLayout(au, &layout, scope: kAudioUnitScope_Output)
+            if err != noErr { logger.warning("Failed to negotiate output channel layout: \(err)"); negotiationSucceeded = false }
         }
+
+        canProcessCurrentLayout = negotiationSucceeded
 
         var frames = maxFrames
         _ = AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &frames, UInt32(MemoryLayout<UInt32>.size))
@@ -192,6 +229,89 @@ final class AUEffectHost: @unchecked Sendable {
 
     func setEnabled(_ enabled: Bool) { _isEnabled = enabled }
 
+    func installParameterObserver(_ handler: @escaping (AudioUnitParameter, AudioUnitParameterValue) -> Void) {
+        parameterChangeHandler = handler
+        guard parameterListener == nil, let au = _audioUnit else { return }
+
+        var listener: AUEventListenerRef?
+        let createStatus = AUEventListenerCreate(
+            auPeerEventListener,
+            Unmanaged.passUnretained(self).toOpaque(),
+            nil,
+            nil,
+            0.02,
+            0.005,
+            &listener
+        )
+        guard createStatus == noErr, let listener else { return }
+
+        var registeredParameter = false
+        let scopes: [AudioUnitScope] = [kAudioUnitScope_Global, kAudioUnitScope_Input, kAudioUnitScope_Output]
+        for scope in scopes {
+            var elementCount: UInt32 = 1
+            if scope != kAudioUnitScope_Global {
+                var elementSize = UInt32(MemoryLayout<UInt32>.size)
+                _ = AudioUnitGetProperty(
+                    au,
+                    kAudioUnitProperty_ElementCount,
+                    scope,
+                    0,
+                    &elementCount,
+                    &elementSize
+                )
+            }
+
+            for element in 0..<max(1, elementCount) {
+                var dataSize: UInt32 = 0
+                var writable = DarwinBoolean(false)
+                guard AudioUnitGetPropertyInfo(
+                    au,
+                    kAudioUnitProperty_ParameterList,
+                    scope,
+                    element,
+                    &dataSize,
+                    &writable
+                ) == noErr,
+                dataSize >= UInt32(MemoryLayout<AudioUnitParameterID>.size) else { continue }
+
+                let parameterCount = Int(dataSize) / MemoryLayout<AudioUnitParameterID>.size
+                let parameters = UnsafeMutablePointer<AudioUnitParameterID>.allocate(capacity: parameterCount)
+                defer { parameters.deallocate() }
+                guard AudioUnitGetProperty(
+                    au,
+                    kAudioUnitProperty_ParameterList,
+                    scope,
+                    element,
+                    parameters,
+                    &dataSize
+                ) == noErr else { continue }
+
+                for index in 0..<parameterCount {
+                    var parameter = AudioUnitParameter(
+                        mAudioUnit: au,
+                        mParameterID: parameters[index],
+                        mScope: scope,
+                        mElement: element
+                    )
+                    if AUListenerAddParameter(listener, Unmanaged.passUnretained(self).toOpaque(), &parameter) == noErr {
+                        registeredParameter = true
+                        observedParameters.append(parameter)
+                    }
+                }
+            }
+        }
+
+        guard registeredParameter else {
+            AUListenerDispose(listener)
+            return
+        }
+        parameterListener = listener
+    }
+
+    fileprivate func notifyParameterChange(_ parameter: AudioUnitParameter, value: AudioUnitParameterValue) {
+        parameterChangeHandler?(parameter, value)
+    }
+
     // MARK: - Real-time rendering
 
     @inline(__always)
@@ -209,6 +329,8 @@ final class AUEffectHost: @unchecked Sendable {
         guard count > 0, buffers.count > 0 else { return }
         let view = AudioBufferListFormatView(buffers)
         guard view.channelCount == format.channelCount else { return }
+        guard renderHandoff.beginRender() else { return }
+        defer { renderHandoff.endRender() }
 
         copyToPlanar(buffers, frameCount: count)
 
@@ -236,6 +358,8 @@ final class AUEffectHost: @unchecked Sendable {
         guard _isEnabled, canProcessCurrentLayout, _audioUnit != nil else { return }
         let count = min(max(0, frameCount), _bufferCapacity)
         guard count > 0, let input = _inputChannels[0], let output = _outputChannels[0] else { return }
+        guard renderHandoff.beginRender() else { return }
+        defer { renderHandoff.endRender() }
         let safeStride = max(1, stride)
         for frame in 0..<count { input[frame] = samples[frame * safeStride] }
         let byteCount = UInt32(count * MemoryLayout<Float>.size)
@@ -273,6 +397,29 @@ final class AUEffectHost: @unchecked Sendable {
         return err == noErr
     }
 
+    /// Applies class-info state only while this host has exclusive render
+    /// ownership. A timeout leaves the current state and audio path intact.
+    /// Parameter listeners are notified after a successful class-info load so
+    /// editors can refresh without causing a recursive peer update.
+    func loadPresetSafely(_ data: Data, timeout: TimeInterval = AUEffectRenderHandoff.maximumWait) -> Bool {
+        let token = renderHandoff.beginRetirement()
+        guard renderHandoff.waitForQuiescence(timeout: timeout) else {
+            renderHandoff.cancelRetirement(ifToken: token)
+            logger.warning("Timed out waiting to load AU class-info state; leaving host rendering")
+            return false
+        }
+
+        let loaded = loadPreset(data)
+        if loaded {
+            for parameter in observedParameters {
+                var changedParameter = parameter
+                _ = AUParameterListenerNotify(nil, nil, &changedParameter)
+            }
+        }
+        renderHandoff.cancelRetirement(ifToken: token)
+        return loaded
+    }
+
     func selectFactoryPreset(index: Int) -> Bool {
         guard let au = _audioUnit else { return false }
         var preset = AUPreset(presetNumber: Int32(index), presetName: nil)
@@ -284,12 +431,26 @@ final class AUEffectHost: @unchecked Sendable {
     }
 
     private var supportsCurrentLayout: Bool {
-        guard !supportedChannelCounts.isEmpty else { return format.channelCount == 2 }
-        return supportedChannelCounts.contains { pair in
-            let inputMatches = pair.input < 0 ? true : pair.input == format.channelCount
-            let outputMatches = pair.output < 0 ? true : pair.output == format.channelCount
-            return inputMatches && outputMatches
-        }
+        let countMatches = supportedChannelCounts.isEmpty
+            ? format.channelCount <= 2
+            : supportedChannelCounts.contains { pair in
+                AUChannelCapabilityMatcher.matches(
+                    input: pair.input,
+                    output: pair.output,
+                    requestedInput: format.channelCount,
+                    requestedOutput: format.channelCount
+                )
+            }
+        guard countMatches else { return false }
+
+        let tag = format.channelLayoutTag
+        let inputTagsAccept = supportedInputLayoutTags.isEmpty ||
+            supportedInputLayoutTags.contains(tag) ||
+            (tag == 0 && supportedInputLayoutTags.contains(kAudioChannelLayoutTag_UseChannelDescriptions))
+        let outputTagsAccept = supportedOutputLayoutTags.isEmpty ||
+            supportedOutputLayoutTags.contains(tag) ||
+            (tag == 0 && supportedOutputLayoutTags.contains(kAudioChannelLayoutTag_UseChannelDescriptions))
+        return inputTagsAccept && outputTagsAccept
     }
 
     private func querySupportedChannelCounts(_ au: AudioUnit) -> [(input: Int, output: Int)] {
@@ -304,16 +465,64 @@ final class AUEffectHost: @unchecked Sendable {
         return (0..<count).map { (Int(ptr[$0].inChannels), Int(ptr[$0].outChannels)) }
     }
 
-    private func querySupportedLayoutTags(_ au: AudioUnit) -> [AudioChannelLayoutTag] {
-        var size: UInt32 = 0
-        let infoErr = AudioUnitGetPropertyInfo(au, kAudioUnitProperty_SupportedChannelLayoutTags, kAudioUnitScope_Global, 0, &size, nil)
-        guard infoErr == noErr, size >= UInt32(MemoryLayout<AudioChannelLayoutTag>.size) else { return [] }
-        let count = Int(size) / MemoryLayout<AudioChannelLayoutTag>.size
-        let ptr = UnsafeMutablePointer<AudioChannelLayoutTag>.allocate(capacity: count)
-        defer { ptr.deallocate() }
-        var mutableSize = size
-        guard AudioUnitGetProperty(au, kAudioUnitProperty_SupportedChannelLayoutTags, kAudioUnitScope_Global, 0, ptr, &mutableSize) == noErr else { return [] }
-        return Array(UnsafeBufferPointer(start: ptr, count: count))
+    private func querySupportedLayoutTags(_ au: AudioUnit) -> (input: [AudioChannelLayoutTag], output: [AudioChannelLayoutTag]) {
+        func query(scope: AudioUnitScope) -> [AudioChannelLayoutTag] {
+            var size: UInt32 = 0
+            let infoErr = AudioUnitGetPropertyInfo(au, kAudioUnitProperty_SupportedChannelLayoutTags, scope, 0, &size, nil)
+            guard infoErr == noErr, size >= UInt32(MemoryLayout<AudioChannelLayoutTag>.size) else { return [] }
+            let count = Int(size) / MemoryLayout<AudioChannelLayoutTag>.size
+            let ptr = UnsafeMutablePointer<AudioChannelLayoutTag>.allocate(capacity: count)
+            defer { ptr.deallocate() }
+            var mutableSize = size
+            guard AudioUnitGetProperty(au, kAudioUnitProperty_SupportedChannelLayoutTags, scope, 0, ptr, &mutableSize) == noErr else { return [] }
+            return Array(UnsafeBufferPointer(start: ptr, count: count))
+        }
+        return (
+            input: query(scope: kAudioUnitScope_Input),
+            output: query(scope: kAudioUnitScope_Output)
+        )
+    }
+
+    private func setAndVerifyStreamFormat(_ au: AudioUnit, _ requested: AudioStreamBasicDescription, scope: AudioUnitScope) -> OSStatus {
+        var value = requested
+        let size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let setStatus = AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, scope, 0, &value, size)
+        guard setStatus == noErr else { return setStatus }
+
+        var accepted = AudioStreamBasicDescription()
+        var acceptedSize = size
+        let getStatus = AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, scope, 0, &accepted, &acceptedSize)
+        guard getStatus == noErr else { return getStatus }
+        let requestedFlags = requested.mFormatFlags & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved)
+        let acceptedFlags = accepted.mFormatFlags & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved)
+        guard accepted.mFormatID == requested.mFormatID,
+              accepted.mChannelsPerFrame == requested.mChannelsPerFrame,
+              abs(accepted.mSampleRate - requested.mSampleRate) < 0.5,
+              acceptedFlags == requestedFlags else {
+            return kAudio_ParamError
+        }
+        return noErr
+    }
+
+    private func setAndVerifyLayout(_ au: AudioUnit, _ requested: inout AudioChannelLayout, scope: AudioUnitScope) -> OSStatus {
+        var infoSize: UInt32 = 0
+        let infoStatus = AudioUnitGetPropertyInfo(au, kAudioUnitProperty_AudioChannelLayout, scope, 0, &infoSize, nil)
+        guard infoStatus == noErr else { return noErr }
+        let size = UInt32(MemoryLayout<AudioChannelLayout>.size)
+        guard infoSize >= size else { return noErr }
+        let setStatus = withUnsafePointer(to: &requested) { layoutPtr in
+            AudioUnitSetProperty(au, kAudioUnitProperty_AudioChannelLayout, scope, 0, layoutPtr, size)
+        }
+        guard setStatus == noErr else { return setStatus }
+
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(infoSize), alignment: MemoryLayout<AudioChannelLayout>.alignment)
+        defer { raw.deallocate() }
+        var actualSize = infoSize
+        let getStatus = AudioUnitGetProperty(au, kAudioUnitProperty_AudioChannelLayout, scope, 0, raw, &actualSize)
+        guard getStatus == noErr else { return getStatus }
+        let accepted = raw.assumingMemoryBound(to: AudioChannelLayout.self).pointee
+        guard accepted.mChannelLayoutTag == requested.mChannelLayoutTag else { return kAudio_ParamError }
+        return noErr
     }
 
     private func loadFactoryPresets() {
