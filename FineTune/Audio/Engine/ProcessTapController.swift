@@ -34,6 +34,51 @@ struct AUEffectChainPublicationTransaction: Equatable {
     }
 }
 
+@MainActor
+private final class ProcessTapPreparedDeviceAUChain: AUChainPreparedToken, @unchecked Sendable {
+    let controllerGeneration: UInt64
+    let oldChain: AUEffectChain?
+    let replacement: AUEffectChain?
+    let oldSecondaryChain: AUEffectChain?
+    let secondaryReplacement: AUEffectChain?
+    let requiresSecondary: Bool
+    let retirementToken: UInt64?
+    let secondaryRetirementToken: UInt64?
+    let bypassed: Bool
+
+    init(
+        requestGeneration: UInt64,
+        controllerGeneration: UInt64,
+        tapIdentity: UUID,
+        previousEntries: [AUEffectChainEntry],
+        currentEntries: [AUEffectChainEntry],
+        oldChain: AUEffectChain?,
+        replacement: AUEffectChain?,
+        oldSecondaryChain: AUEffectChain?,
+        secondaryReplacement: AUEffectChain?,
+        requiresSecondary: Bool,
+        retirementToken: UInt64?,
+        secondaryRetirementToken: UInt64?,
+        bypassed: Bool
+    ) {
+        self.controllerGeneration = controllerGeneration
+        self.oldChain = oldChain
+        self.replacement = replacement
+        self.oldSecondaryChain = oldSecondaryChain
+        self.secondaryReplacement = secondaryReplacement
+        self.requiresSecondary = requiresSecondary
+        self.retirementToken = retirementToken
+        self.secondaryRetirementToken = secondaryRetirementToken
+        self.bypassed = bypassed
+        super.init(
+            requestGeneration: requestGeneration,
+            tapIdentity: tapIdentity,
+            previousEntries: previousEntries,
+            currentEntries: currentEntries
+        )
+    }
+}
+
 // MARK: - Threading Model
 //
 // ProcessTapController bridges two execution domains:
@@ -55,6 +100,7 @@ struct AUEffectChainPublicationTransaction: Equatable {
 @MainActor
 final class ProcessTapController: ProcessTapControlling {
     let app: AudioApp
+    let auTransactionOwnerID = UUID()
     private let logger: Logger
     // Note: This queue is passed to AudioDeviceCreateIOProcIDWithBlock but the actual
     // audio callback runs on CoreAudio's real-time HAL I/O thread, not this queue.
@@ -178,6 +224,7 @@ final class ProcessTapController: ProcessTapControlling {
     private var _currentDeviceAUEntries: [AUEffectChainEntry] = []
     private var auChainGeneration: UInt64 = 0
     private var deviceAUChainGeneration: UInt64 = 0
+    private var preparedDeviceAUChains: [UUID: ProcessTapPreparedDeviceAUChain] = [:]
 
     // Target device UIDs for synchronized multi-output (first is clock source)
     private var targetDeviceUIDs: [String]
@@ -434,6 +481,132 @@ final class ProcessTapController: ProcessTapControlling {
             entries: preparedEntries,
             completion: completion
         )
+    }
+
+    func prepareDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        requestGeneration: UInt64,
+        completion: @escaping @MainActor @Sendable (AUChainPreparationResult) -> Void
+    ) {
+        for token in Array(preparedDeviceAUChains.values) {
+            abortPreparedDeviceAUEffectChain(token)
+        }
+        preparedDeviceAUChains.removeAll()
+
+        let format = currentAUFormat()
+        let old = deviceAUEffectChain
+        let preparedEntries = prepareEntriesForReplacement(entries, oldChain: old, format: format)
+        let replacement = preparedEntries.isEmpty ? nil : AUEffectChain(
+            entries: preparedEntries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: old
+        )
+        let bypassed = old?.isBypassed == true
+        deviceAUChainGeneration &+= 1
+        let controllerGeneration = deviceAUChainGeneration
+        let hasSecondary = secondaryResources.isActive
+        let oldSecondary = hasSecondary ? secondaryDeviceAUEffectChain : nil
+        let secondaryReplacement = hasSecondary && !preparedEntries.isEmpty ? AUEffectChain(
+            entries: preparedEntries,
+            sampleRate: format.sampleRate,
+            format: format,
+            reusing: oldSecondary
+        ) : nil
+        let retirementToken = old?.beginRetirement()
+        let secondaryRetirementToken = oldSecondary?.beginRetirement()
+
+        Task.detached(priority: .userInitiated) { [weak self, old, replacement, oldSecondary, secondaryReplacement] in
+            let primaryQuiesced = old?.waitForRenderQuiescence() ?? true
+            let secondaryQuiesced = hasSecondary ? (oldSecondary?.waitForRenderQuiescence() ?? true) : true
+            var transaction = AUEffectChainPublicationTransaction(generation: controllerGeneration, requiresSecondary: hasSecondary)
+            transaction.recordPrimary(primaryQuiesced)
+            transaction.recordSecondary(secondaryQuiesced)
+
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { oldSecondary?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    completion(.superseded)
+                    return
+                }
+                guard self.deviceAUChainGeneration == controllerGeneration else {
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { oldSecondary?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    completion(.superseded)
+                    return
+                }
+                guard transaction.canPublish(for: controllerGeneration) else {
+                    if let retirementToken { old?.cancelRetirement(ifToken: retirementToken) }
+                    if let secondaryRetirementToken { oldSecondary?.cancelRetirement(ifToken: secondaryRetirementToken) }
+                    self.logger.warning("Device AU prepare timed out; preserving the active chain and reported entries")
+                    completion(.rejected(reason: .timedOut))
+                    return
+                }
+                let token = ProcessTapPreparedDeviceAUChain(
+                    requestGeneration: requestGeneration,
+                    controllerGeneration: controllerGeneration,
+                    tapIdentity: self.auTransactionOwnerID,
+                    previousEntries: self._currentDeviceAUEntries,
+                    currentEntries: preparedEntries,
+                    oldChain: old,
+                    replacement: replacement,
+                    oldSecondaryChain: oldSecondary,
+                    secondaryReplacement: secondaryReplacement,
+                    requiresSecondary: hasSecondary,
+                    retirementToken: retirementToken,
+                    secondaryRetirementToken: secondaryRetirementToken,
+                    bypassed: oldSecondary?.isBypassed == true || bypassed
+                )
+                self.preparedDeviceAUChains[token.tokenID] = token
+                completion(.prepared(token))
+            }
+        }
+    }
+
+    func claimPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken, requestGeneration: UInt64) -> Bool {
+        guard let token = token as? ProcessTapPreparedDeviceAUChain,
+              preparedDeviceAUChains[token.tokenID] === token,
+              deviceAUChainGeneration == token.controllerGeneration else { return false }
+        guard token.claimCommit(
+            tapIdentity: auTransactionOwnerID,
+            requestGeneration: requestGeneration
+        ) else {
+            abortPreparedDeviceAUEffectChain(token)
+            return false
+        }
+        return true
+    }
+
+    func commitClaimedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        guard let token = token as? ProcessTapPreparedDeviceAUChain,
+              preparedDeviceAUChains[token.tokenID] === token,
+              token.lifecycle == .commitClaimed else { return }
+        closeReplacedPluginWindows(oldChain: token.oldChain, replacementEntries: token.currentEntries)
+        publishAUChainPair(
+            token.replacement,
+            secondary: token.secondaryReplacement,
+            publishSecondary: token.requiresSecondary,
+            device: true,
+            bypassed: token.bypassed,
+            entries: token.currentEntries
+        )
+        updateMaxTailTime()
+        _ = token.finishCommit()
+        preparedDeviceAUChains.removeValue(forKey: token.tokenID)
+    }
+
+    func abortPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        guard let token = token as? ProcessTapPreparedDeviceAUChain,
+              preparedDeviceAUChains[token.tokenID] === token else { return }
+        guard token.abort() else { return }
+        if let retirementToken = token.retirementToken {
+            token.oldChain?.cancelRetirement(ifToken: retirementToken)
+        }
+        if let secondaryRetirementToken = token.secondaryRetirementToken {
+            token.oldSecondaryChain?.cancelRetirement(ifToken: secondaryRetirementToken)
+        }
+        preparedDeviceAUChains.removeValue(forKey: token.tokenID)
     }
 
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { _currentDeviceAUEntries }

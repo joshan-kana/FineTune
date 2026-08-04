@@ -9,14 +9,159 @@ private struct PendingAppAURequest {
     let state: AUChainState
 }
 
-private struct PendingDeviceAURequest {
-    let token: UUID
+private struct PendingDeviceAUState {
+    let generation: UInt64
     let state: AUChainState
-    let previousEntries: [AUEffectChainEntry]
-    let expectedPIDs: Set<pid_t>
-    var completedPIDs: Set<pid_t> = []
-    var committedPIDs: Set<pid_t> = []
-    var failed = false
+}
+
+@MainActor
+final class DeviceAUChainTransactionCoordinator {
+    private final class Request {
+        let deviceUID: String
+        let generation: UInt64
+        let entries: [AUEffectChainEntry]
+        let participants: [pid_t: any ProcessTapControlling]
+        var prepared: [pid_t: AUChainPreparedToken] = [:]
+        let onCommitted: @MainActor () -> Void
+        let onRejected: @MainActor (AUChainUpdateResult) -> Void
+
+        init(
+            deviceUID: String,
+            generation: UInt64,
+            entries: [AUEffectChainEntry],
+            participants: [pid_t: any ProcessTapControlling],
+            onCommitted: @escaping @MainActor () -> Void,
+            onRejected: @escaping @MainActor (AUChainUpdateResult) -> Void
+        ) {
+            self.deviceUID = deviceUID
+            self.generation = generation
+            self.entries = entries
+            self.participants = participants
+            self.onCommitted = onCommitted
+            self.onRejected = onRejected
+        }
+    }
+
+    private var requests: [String: Request] = [:]
+
+    func begin(
+        deviceUID: String,
+        generation: UInt64,
+        entries: [AUEffectChainEntry],
+        participants: [pid_t: any ProcessTapControlling],
+        onCommitted: @escaping @MainActor () -> Void,
+        onRejected: @escaping @MainActor (AUChainUpdateResult) -> Void
+    ) {
+        if let previous = requests.removeValue(forKey: deviceUID) {
+            abort(previous)
+            previous.onRejected(.superseded)
+        }
+
+        let request = Request(
+            deviceUID: deviceUID,
+            generation: generation,
+            entries: entries,
+            participants: participants,
+            onCommitted: onCommitted,
+            onRejected: onRejected
+        )
+        requests[deviceUID] = request
+
+        guard !participants.isEmpty else {
+            requests.removeValue(forKey: deviceUID)
+            onCommitted()
+            return
+        }
+
+        for (pid, tap) in participants {
+            tap.prepareDeviceAUEffectChain(entries, requestGeneration: generation) { [weak self] result in
+                self?.prepared(deviceUID: deviceUID, generation: generation, pid: pid, tap: tap, result: result)
+            }
+        }
+    }
+
+    func tapDidDisappear(_ tap: any ProcessTapControlling) {
+        for request in Array(requests.values) where request.participants.values.contains(where: { $0.auTransactionOwnerID == tap.auTransactionOwnerID }) {
+            fail(request, result: .superseded)
+        }
+    }
+
+    func cancel(deviceUID: String) {
+        guard let request = requests.removeValue(forKey: deviceUID) else { return }
+        abort(request)
+        request.onRejected(.superseded)
+    }
+
+    private func prepared(
+        deviceUID: String,
+        generation: UInt64,
+        pid: pid_t,
+        tap: any ProcessTapControlling,
+        result: AUChainPreparationResult
+    ) {
+        guard let request = requests[deviceUID], request.generation == generation else {
+            if case .prepared(let token) = result {
+                tap.abortPreparedDeviceAUEffectChain(token)
+            }
+            return
+        }
+
+        switch result {
+        case .prepared(let token):
+            guard request.participants[pid]?.auTransactionOwnerID == tap.auTransactionOwnerID,
+                  token.requestGeneration == generation,
+                  token.tapIdentity == tap.auTransactionOwnerID else {
+                tap.abortPreparedDeviceAUEffectChain(token)
+                fail(request, result: .superseded)
+                return
+            }
+            request.prepared[pid] = token
+            guard request.prepared.count == request.participants.count else { return }
+            commit(request)
+        case .rejected(let reason):
+            fail(request, result: .rejected(reason: reason))
+        case .superseded:
+            fail(request, result: .superseded)
+        }
+    }
+
+    private func commit(_ request: Request) {
+        guard requests[request.deviceUID] === request else { return }
+
+        var claimed: [(any ProcessTapControlling, AUChainPreparedToken)] = []
+        for (pid, tap) in request.participants {
+            guard let token = request.prepared[pid],
+                  tap.claimPreparedDeviceAUEffectChain(token, requestGeneration: request.generation) else {
+                abort(request)
+                requests.removeValue(forKey: request.deviceUID)
+                request.onRejected(.superseded)
+                return
+            }
+            claimed.append((tap, token))
+        }
+
+        // Claims are consumed before any publication. The following calls are
+        // synchronous and cannot begin another handoff or fail asynchronously.
+        for (tap, token) in claimed {
+            tap.commitClaimedDeviceAUEffectChain(token)
+        }
+        requests.removeValue(forKey: request.deviceUID)
+        request.onCommitted()
+    }
+
+    private func fail(_ request: Request, result: AUChainUpdateResult) {
+        guard requests[request.deviceUID] === request else { return }
+        requests.removeValue(forKey: request.deviceUID)
+        abort(request)
+        request.onRejected(result)
+    }
+
+    private func abort(_ request: Request) {
+        for (pid, token) in request.prepared {
+            request.participants[pid]?.abortPreparedDeviceAUEffectChain(token)
+        }
+        request.prepared.removeAll()
+    }
 }
 
 @Observable
@@ -48,7 +193,9 @@ final class AudioEngine {
     /// Per-device AU state. Keyed by device UID.
     private(set) var deviceAU: [String: AUChainState] = [:]
     private var pendingAppAU: [String: PendingAppAURequest] = [:]
-    private var pendingDeviceAU: [String: PendingDeviceAURequest] = [:]
+    private var pendingDeviceAU: [String: PendingDeviceAUState] = [:]
+    private var nextDeviceAUGeneration: UInt64 = 0
+    private let deviceAUCoordinator = DeviceAUChainTransactionCoordinator()
     /// Favorited AU plugin IDs.
     private(set) var favoriteAUPluginIDs: Set<String> = []
     /// Plugin IDs that were active during a crash.
@@ -499,6 +646,7 @@ final class AudioEngine {
         appListCoordinator.recordIgnore(app)
 
         if let tap = taps.removeValue(forKey: app.id) {
+            deviceAUCoordinator.tapDidDisappear(tap)
             tap.invalidate()
         }
         appDeviceRouting.removeValue(forKey: app.id)
@@ -619,6 +767,7 @@ final class AudioEngine {
         processMonitor.stop()
         deviceMonitor.stop()
         for tap in taps.values {
+            deviceAUCoordinator.tapDidDisappear(tap)
             tap.invalidate()
         }
         taps.removeAll()
@@ -1064,68 +1213,44 @@ final class AudioEngine {
         for deviceUID: String,
         onCommitted: @escaping @MainActor @Sendable () -> Void = {}
     ) {
-        if pendingDeviceAU[deviceUID] != nil {
-            logger.warning("Superseding pending device AU update for \(deviceUID, privacy: .public)")
-        }
         let matchingTaps = taps.filter { $0.value.currentDeviceUIDs.contains(deviceUID) }
-        let token = UUID()
-        let previousEntries = deviceAU[deviceUID]?.entries ?? []
-        pendingDeviceAU[deviceUID] = PendingDeviceAURequest(
-            token: token,
-            state: state,
-            previousEntries: previousEntries,
-            expectedPIDs: Set(matchingTaps.map(\.key))
+        nextDeviceAUGeneration &+= 1
+        let generation = nextDeviceAUGeneration
+        pendingDeviceAU[deviceUID] = PendingDeviceAUState(
+            generation: generation,
+            state: state
         )
-        if matchingTaps.isEmpty {
-            finishDeviceAUUpdate(deviceUID: deviceUID, token: token, pid: nil, result: .committed, onCommitted: onCommitted)
-            return
-        }
-        for (pid, tap) in matchingTaps {
-            tap.updateDeviceAUEffectChain(state.entries) { [weak self] result in
-                self?.finishDeviceAUUpdate(deviceUID: deviceUID, token: token, pid: pid, result: result, onCommitted: onCommitted)
-            }
-        }
-    }
-
-    private func finishDeviceAUUpdate(
-        deviceUID: String,
-        token: UUID,
-        pid: pid_t?,
-        result: AUChainUpdateResult,
-        onCommitted: @escaping @MainActor @Sendable () -> Void
-    ) {
-        guard var request = pendingDeviceAU[deviceUID], request.token == token else { return }
-        if let pid {
-            request.completedPIDs.insert(pid)
-            if case .committed = result {
-                request.committedPIDs.insert(pid)
-            } else {
-                if !request.failed {
-                    logger.warning("Device AU update rejected for \(deviceUID, privacy: .public); retaining the previous chain on every tap")
+        deviceAUCoordinator.begin(
+            deviceUID: deviceUID,
+            generation: generation,
+            entries: state.entries,
+            participants: matchingTaps,
+            onCommitted: { [weak self] in
+                guard let self,
+                      self.pendingDeviceAU[deviceUID]?.generation == generation else { return }
+                self.pendingDeviceAU.removeValue(forKey: deviceUID)
+                self.deviceAU[deviceUID] = state.entries.isEmpty ? nil : state
+                self.settingsManager.setDeviceAUEffectChain(state.entries, for: deviceUID)
+                if state.isBypassed {
+                    for (_, tap) in self.taps where tap.currentDeviceUIDs.contains(deviceUID) {
+                        tap.setDeviceAUChainBypassed(true)
+                    }
                 }
-                request.failed = true
+                self.syncDeviceAUFailedIDs(for: deviceUID)
+                onCommitted()
+            },
+            onRejected: { [weak self] result in
+                guard let self,
+                      self.pendingDeviceAU[deviceUID]?.generation == generation else { return }
+                self.pendingDeviceAU.removeValue(forKey: deviceUID)
+                switch result {
+                case .rejected, .superseded:
+                    self.logger.warning("Device AU update rejected for \(deviceUID, privacy: .public); retaining the previous chain on every tap")
+                case .committed:
+                    break
+                }
             }
-        }
-
-        if request.failed {
-            for committedPID in request.committedPIDs {
-                taps[committedPID]?.updateDeviceAUEffectChain(request.previousEntries) { _ in }
-            }
-        }
-        pendingDeviceAU[deviceUID] = request
-        guard request.completedPIDs == request.expectedPIDs else { return }
-        pendingDeviceAU.removeValue(forKey: deviceUID)
-        guard !request.failed else { return }
-
-        deviceAU[deviceUID] = request.state.entries.isEmpty ? nil : request.state
-        settingsManager.setDeviceAUEffectChain(request.state.entries, for: deviceUID)
-        if request.state.isBypassed {
-            for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
-                tap.setDeviceAUChainBypassed(true)
-            }
-        }
-        syncDeviceAUFailedIDs(for: deviceUID)
-        onCommitted()
+        )
     }
 
     func saveAllLiveAUState() {
@@ -2300,6 +2425,7 @@ final class AudioEngine {
 
                 // Now safe to cleanup
                 if let tap = self.taps.removeValue(forKey: pid) {
+                    self.deviceAUCoordinator.tapDidDisappear(tap)
                     tap.invalidate()
                     self.logger.debug("Cleaned up stale tap for PID \(pid)")
                 }
@@ -2394,6 +2520,7 @@ final class AudioEngine {
     /// to prevent orphaned IO procs from accumulating (issue #176).
     private func recreateTap(for pid: pid_t) async {
         guard let oldTap = taps.removeValue(forKey: pid) else { return }
+        deviceAUCoordinator.tapDidDisappear(oldTap)
         let deviceUIDs = oldTap.currentDeviceUIDs
         await oldTap.invalidateAsync()
 

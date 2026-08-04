@@ -49,12 +49,18 @@ final class RecordingProcessTapController: ProcessTapControlling {
     }
 
     let app: AudioApp
+    let auTransactionOwnerID = UUID()
     private(set) var events: [Event] = []
     var appAUResult: AUChainUpdateResult = .committed
     var deviceAUResult: AUChainUpdateResult = .committed
     var deferAUCompletions = false
     private(set) var pendingAppAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
     private(set) var pendingDeviceAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
+    private(set) var pendingDevicePrepareCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
+    private(set) var publishedDeviceEntries: [[AUEffectChainEntry]] = []
+    private(set) var abortedDeviceTokenIDs: [UUID] = []
+    var deferDevicePrepares = false
+    private var deviceEntries: [AUEffectChainEntry] = []
     private var lastAppAUCompletion: (@MainActor @Sendable (AUChainUpdateResult) -> Void)?
 
     // Mutable surface — recorded as plain property writes (not events).
@@ -129,6 +135,48 @@ final class RecordingProcessTapController: ProcessTapControlling {
         }
     }
 
+    func prepareDeviceAUEffectChain(
+        _ entries: [AUEffectChainEntry],
+        requestGeneration: UInt64,
+        completion: @escaping @MainActor @Sendable (AUChainPreparationResult) -> Void
+    ) {
+        let token = AUChainPreparedToken(
+            requestGeneration: requestGeneration,
+            tapIdentity: auTransactionOwnerID,
+            previousEntries: deviceEntries,
+            currentEntries: entries
+        )
+        if deferDevicePrepares {
+            pendingDevicePrepareCompletions.append { result in
+                switch result {
+                case .committed:
+                    completion(.prepared(token))
+                case .rejected(let reason):
+                    completion(.rejected(reason: reason))
+                case .superseded:
+                    completion(.superseded)
+                }
+            }
+        } else {
+            completion(.prepared(token))
+        }
+    }
+
+    func claimPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken, requestGeneration: UInt64) -> Bool {
+        token.claimCommit(tapIdentity: auTransactionOwnerID, requestGeneration: requestGeneration)
+    }
+
+    func commitClaimedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        guard token.finishCommit() else { return }
+        deviceEntries = token.currentEntries
+        publishedDeviceEntries.append(token.currentEntries)
+    }
+
+    func abortPreparedDeviceAUEffectChain(_ token: AUChainPreparedToken) {
+        guard token.abort() else { return }
+        abortedDeviceTokenIDs.append(token.tokenID)
+    }
+
     func completeNextAppAU(_ result: AUChainUpdateResult) {
         guard !pendingAppAUCompletions.isEmpty else { return }
         pendingAppAUCompletions.removeFirst()(result)
@@ -141,6 +189,11 @@ final class RecordingProcessTapController: ProcessTapControlling {
     func completeNextDeviceAU(_ result: AUChainUpdateResult) {
         guard !pendingDeviceAUCompletions.isEmpty else { return }
         pendingDeviceAUCompletions.removeFirst()(result)
+    }
+
+    func completeNextDevicePrepare(_ result: AUChainUpdateResult = .committed) {
+        guard !pendingDevicePrepareCompletions.isEmpty else { return }
+        pendingDevicePrepareCompletions.removeFirst()(result)
     }
 
     func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws {
@@ -343,37 +396,17 @@ struct AudioEngineTapInitialStateTests {
         let taps = fix.allTaps()
         #expect(taps.count == 2)
 
+        taps.forEach { $0.deferDevicePrepares = true }
         fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: testPlugin())
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).isEmpty)
+        #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid).isEmpty)
+        taps[0].completeNextDevicePrepare()
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).isEmpty)
+        taps[1].completeNextDevicePrepare()
 
         #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).count == 1)
         #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid).count == 1)
-        #expect(taps.allSatisfy { tap in
-            tap.events.contains { if case .updateDeviceAUEffectChain = $0 { return true }; return false }
-        })
-    }
-
-    @Test("A device tap timeout rolls back successful peers without partial publication")
-    func deviceAUTapTimeoutRollsBackPeers() throws {
-        let fix = makeFixture()
-        let secondApp = secondTestApp()
-        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
-        fix.engine.setDevice(for: secondApp, deviceUID: fix.device.uid)
-        let taps = fix.allTaps()
-        #expect(taps.count == 2)
-        fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: testPlugin())
-        let oldEntries = fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid)
-
-        taps.forEach { $0.deferAUCompletions = true }
-        fix.engine.removeDeviceAUEffect(deviceUID: fix.device.uid, entryID: try #require(oldEntries.first?.id))
-        taps[0].completeNextDeviceAU(.committed)
-        taps[1].completeNextDeviceAU(.rejected(reason: .timedOut))
-
-        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid) == oldEntries)
-        #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid) == oldEntries)
-        #expect(taps[0].events.contains { event in
-            if case .updateDeviceAUEffectChain(let entries) = event { return entries == oldEntries }
-            return false
-        })
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.count == 1 })
     }
 
     @Test("Failed app AU removal retains the editor's chain state")
@@ -622,6 +655,159 @@ struct AudioEngineTapInitialStateTests {
             return nil
         }
         #expect(postActivateAutoEQ.contains(where: { $0 == nil }))
+    }
+}
+
+@MainActor
+private func makeCoordinatorTaps() -> [RecordingProcessTapController] {
+    [
+        RecordingProcessTapController(
+            app: AudioApp(id: 20001, processObjectIDs: [], name: "One", icon: NSImage(), bundleID: "com.test.coordinator.one"),
+            deviceUIDs: ["uid-test"]
+        ),
+        RecordingProcessTapController(
+            app: AudioApp(id: 20002, processObjectIDs: [], name: "Two", icon: NSImage(), bundleID: "com.test.coordinator.two"),
+            deviceUIDs: ["uid-test"]
+        )
+    ]
+}
+
+@MainActor
+private final class CoordinatorResultBox {
+    var committed = 0
+    var rejected: [AUChainUpdateResult] = []
+}
+
+@Suite("Device AU prepare/commit/abort coordinator")
+@MainActor
+struct DeviceAUChainTransactionCoordinatorTests {
+    private func entries() -> [AUEffectChainEntry] {
+        [AUEffectChainEntry(plugin: AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        ))]
+    }
+
+    private func coordinator(
+        taps: [RecordingProcessTapController],
+        result: CoordinatorResultBox
+    ) -> DeviceAUChainTransactionCoordinator {
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 7,
+            entries: entries(),
+            participants: [10001: taps[0], 10002: taps[1]],
+            onCommitted: { result.committed += 1 },
+            onRejected: { result.rejected.append($0) }
+        )
+        return coordinator
+    }
+
+    @Test("Two taps prepare and both commit one generation")
+    func bothPrepareAndCommit() {
+        let taps = makeCoordinatorTaps()
+        let result = CoordinatorResultBox()
+        _ = coordinator(taps: taps, result: result)
+
+        #expect(result.committed == 1)
+        #expect(result.rejected.isEmpty)
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.count == 1 })
+        #expect(taps.allSatisfy { $0.abortedDeviceTokenIDs.isEmpty })
+    }
+
+    @Test("A timeout aborts the first prepared tap without partial publication")
+    func secondPrepareTimeoutAbortsAll() {
+        let taps = makeCoordinatorTaps()
+        taps.forEach { $0.deferDevicePrepares = true }
+        let result = CoordinatorResultBox()
+        let coordinator = coordinator(taps: taps, result: result)
+
+        taps[0].completeNextDevicePrepare()
+        taps[1].completeNextDevicePrepare(.rejected(reason: .timedOut))
+
+        #expect(result.committed == 0)
+        #expect(result.rejected == [.rejected(reason: .timedOut)])
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.isEmpty })
+        #expect(taps[0].abortedDeviceTokenIDs.count == 1)
+    }
+
+    @Test("A superseded prepare aborts every prepared token")
+    func supersededPrepareAbortsAll() {
+        let taps = makeCoordinatorTaps()
+        taps.forEach { $0.deferDevicePrepares = true }
+        let result = CoordinatorResultBox()
+        let coordinator = coordinator(taps: taps, result: result)
+
+        taps[0].completeNextDevicePrepare()
+        coordinator.cancel(deviceUID: "uid-test")
+        taps[1].completeNextDevicePrepare()
+
+        #expect(result.committed == 0)
+        #expect(result.rejected == [.superseded])
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.isEmpty })
+        #expect(taps.allSatisfy { $0.abortedDeviceTokenIDs.count == 1 })
+    }
+
+    @Test("A disappearing tap aborts prepared and late tokens")
+    func disappearingTapAbortsAll() {
+        let taps = makeCoordinatorTaps()
+        taps.forEach { $0.deferDevicePrepares = true }
+        let result = CoordinatorResultBox()
+        let coordinator = coordinator(taps: taps, result: result)
+
+        taps[0].completeNextDevicePrepare()
+        coordinator.tapDidDisappear(taps[0])
+        taps[1].completeNextDevicePrepare()
+
+        #expect(result.committed == 0)
+        #expect(result.rejected == [.superseded])
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.isEmpty })
+        #expect(taps.allSatisfy { $0.abortedDeviceTokenIDs.count == 1 })
+    }
+
+    @Test("Stale token cannot commit")
+    func staleTokenCannotCommit() {
+        let tap = makeCoordinatorTaps()[0]
+        let token = AUChainPreparedToken(
+            requestGeneration: 7,
+            tapIdentity: tap.auTransactionOwnerID,
+            previousEntries: [],
+            currentEntries: entries()
+        )
+
+        #expect(!tap.claimPreparedDeviceAUEffectChain(token, requestGeneration: 8))
+        tap.abortPreparedDeviceAUEffectChain(token)
+        #expect(token.lifecycle == .aborted)
+        #expect(!token.claimCommit(tapIdentity: tap.auTransactionOwnerID, requestGeneration: 7))
+    }
+
+    @Test("Token commit and abort are each consumed exactly once")
+    func tokenConsumptionIsOneShot() {
+        let tap = makeCoordinatorTaps()[0]
+        let commitToken = AUChainPreparedToken(
+            requestGeneration: 1,
+            tapIdentity: tap.auTransactionOwnerID,
+            previousEntries: [],
+            currentEntries: entries()
+        )
+        #expect(commitToken.claimCommit(tapIdentity: tap.auTransactionOwnerID, requestGeneration: 1))
+        #expect(commitToken.finishCommit())
+        #expect(!commitToken.finishCommit())
+        #expect(!commitToken.abort())
+
+        let abortToken = AUChainPreparedToken(
+            requestGeneration: 1,
+            tapIdentity: tap.auTransactionOwnerID,
+            previousEntries: [],
+            currentEntries: entries()
+        )
+        #expect(abortToken.abort())
+        #expect(!abortToken.abort())
     }
 }
 
