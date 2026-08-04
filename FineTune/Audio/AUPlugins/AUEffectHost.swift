@@ -31,6 +31,8 @@ final class AUEffectHost: @unchecked Sendable {
     private nonisolated(unsafe) var _sampleTime: Float64 = 0
     private var parameterListener: AUEventListenerRef?
     private var parameterChangeHandler: ((AudioUnitParameter, AudioUnitParameterValue) -> Void)?
+    private var observedParameters: [AudioUnitParameter] = []
+    private let renderHandoff = AUEffectRenderHandoff()
 
     let _bufferCapacity: Int
     let _channelCapacity: Int
@@ -53,6 +55,10 @@ final class AUEffectHost: @unchecked Sendable {
 
     var isEnabled: Bool { _isEnabled }
     var audioUnit: AudioUnit? { _audioUnit }
+
+    #if DEBUG
+    var observedParameterCountForTesting: Int { observedParameters.count }
+    #endif
 
     var compatibilityDescription: String {
         guard canProcessCurrentLayout else {
@@ -281,6 +287,7 @@ final class AUEffectHost: @unchecked Sendable {
                     )
                     if AUListenerAddParameter(listener, Unmanaged.passUnretained(self).toOpaque(), &parameter) == noErr {
                         registeredParameter = true
+                        observedParameters.append(parameter)
                     }
                 }
             }
@@ -314,6 +321,8 @@ final class AUEffectHost: @unchecked Sendable {
         guard count > 0, buffers.count > 0 else { return }
         let view = AudioBufferListFormatView(buffers)
         guard view.channelCount == format.channelCount else { return }
+        guard renderHandoff.beginRender() else { return }
+        defer { renderHandoff.endRender() }
 
         copyToPlanar(buffers, frameCount: count)
 
@@ -341,6 +350,8 @@ final class AUEffectHost: @unchecked Sendable {
         guard _isEnabled, canProcessCurrentLayout, _audioUnit != nil else { return }
         let count = min(max(0, frameCount), _bufferCapacity)
         guard count > 0, let input = _inputChannels[0], let output = _outputChannels[0] else { return }
+        guard renderHandoff.beginRender() else { return }
+        defer { renderHandoff.endRender() }
         let safeStride = max(1, stride)
         for frame in 0..<count { input[frame] = samples[frame * safeStride] }
         let byteCount = UInt32(count * MemoryLayout<Float>.size)
@@ -376,6 +387,29 @@ final class AUEffectHost: @unchecked Sendable {
         queryTailTime()
         queryLatency()
         return err == noErr
+    }
+
+    /// Applies class-info state only while this host has exclusive render
+    /// ownership. A timeout leaves the current state and audio path intact.
+    /// Parameter listeners are notified after a successful class-info load so
+    /// editors can refresh without causing a recursive peer update.
+    func loadPresetSafely(_ data: Data, timeout: TimeInterval = AUEffectRenderHandoff.maximumWait) -> Bool {
+        let token = renderHandoff.beginRetirement()
+        guard renderHandoff.waitForQuiescence(timeout: timeout) else {
+            renderHandoff.cancelRetirement(ifToken: token)
+            logger.warning("Timed out waiting to load AU class-info state; leaving host rendering")
+            return false
+        }
+
+        let loaded = loadPreset(data)
+        if loaded {
+            for parameter in observedParameters {
+                var changedParameter = parameter
+                _ = AUParameterListenerNotify(nil, nil, &changedParameter)
+            }
+        }
+        renderHandoff.cancelRetirement(ifToken: token)
+        return loaded
     }
 
     func selectFactoryPreset(index: Int) -> Bool {

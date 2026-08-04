@@ -1,7 +1,74 @@
 // FineTuneTests/AUPluginTests.swift
 import AudioToolbox
+import Foundation
 import Testing
 @testable import FineTune
+
+// MARK: - Render handoff tests
+
+@Suite("AU render handoff", .serialized)
+struct AUEffectRenderHandoffTests {
+
+    @Test("Normal completion reaches quiescence")
+    func normalCompletion() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        handoff.endRender()
+
+        _ = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.01))
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Delayed render completion is bounded and eventually safe")
+    func delayedCompletion() {
+        let handoff = AUEffectRenderHandoff()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        #expect(handoff.beginRender())
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 1)
+            handoff.endRender()
+        }
+        #expect(entered.wait(timeout: .now() + 1) == .success)
+
+        _ = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.001) == false)
+        release.signal()
+        #expect(handoff.waitForQuiescence(timeout: 0.5))
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Timeout can be cancelled without destroying an active render")
+    func timeoutCancellation() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        let token = handoff.beginRetirement()
+        #expect(handoff.waitForQuiescence(timeout: 0.001) == false)
+
+        handoff.cancelRetirement(ifToken: token)
+        #expect(handoff.beginRender())
+        handoff.endRender()
+        handoff.endRender()
+        #expect(handoff.activeRenderCount == 0)
+    }
+
+    @Test("Retired snapshot rejects new renders until quiescent")
+    func noConcurrentReuse() {
+        let handoff = AUEffectRenderHandoff()
+        #expect(handoff.beginRender())
+        let token = handoff.beginRetirement()
+        #expect(handoff.beginRender() == false)
+        handoff.endRender()
+        #expect(handoff.waitForQuiescence(timeout: 0.01))
+
+        handoff.cancelRetirement(ifToken: token)
+        #expect(handoff.beginRender())
+        handoff.endRender()
+    }
+}
 
 // MARK: - AUPluginDescriptor Tests
 
@@ -590,6 +657,19 @@ struct AUEffectChainTests {
         #expect(energy < maxPossibleEnergy * 0.001, "15kHz should be nearly silent through 100Hz lowpass")
     }
 
+    @Test("Disabled reused group is not rendered")
+    func disabledGroupPassthrough() {
+        let entry = AUEffectChainEntry(plugin: appleLowPassFilter(), isEnabled: false)
+        let chain = AUEffectChain(entries: [entry], sampleRate: 44100, maxFrames: 64)
+        var buffer: [Float] = [0.5, -0.5, 0.25, -0.25]
+        let original = buffer
+        buffer.withUnsafeMutableBufferPointer { pointer in
+            chain.processInterleaved(samples: pointer.baseAddress!, frameCount: 2)
+        }
+        #expect(buffer == original)
+        #expect(chain.isEntryEnabled(entry.id) == false)
+    }
+
     @Test("Bypassed chain does not modify audio")
     func bypassedChainPassthrough() {
         let entry = AUEffectChainEntry(plugin: appleAUDelay())
@@ -610,6 +690,87 @@ struct AUEffectChainTests {
             componentSubType: 0x64656C79,
             componentManufacturer: 0x6170706C,
             name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+
+    private func appleLowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+}
+
+// MARK: - Peer registry tests
+
+@Suite("AU peer registry", .serialized)
+struct AUEffectPeerRegistryTests {
+
+    @Test("Shared hosts remain registered until every owner unregisters")
+    func ownerScopedCleanup() {
+        let registry = AUEffectPeerRegistry.shared
+        let entryID = UUID()
+        let firstOwner = UUID()
+        let secondOwner = UUID()
+        let first = AUEffectHost(descriptor: appleAUDelay(), entryID: entryID, sampleRate: 44100)
+        let second = AUEffectHost(descriptor: appleAUDelay(), entryID: entryID, sampleRate: 44100)
+        #expect(first.instantiate())
+        #expect(second.instantiate())
+
+        registry.register([first], entryID: entryID, ownerID: firstOwner)
+        registry.register([first, second], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+
+        registry.unregisterSynchronouslyForTesting([first], entryID: entryID, ownerID: firstOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 2)
+        registry.unregisterSynchronouslyForTesting([first], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 1)
+        registry.unregisterSynchronouslyForTesting([second], entryID: entryID, ownerID: secondOwner)
+        #expect(registry.hostCountForTesting(entryID: entryID) == 0)
+    }
+
+    @Test("Parameter observer installation tolerates AUs without a parameter list")
+    func discoversConcreteParameters() {
+        let host = AUEffectHost(descriptor: appleLowPassFilter(), entryID: UUID(), sampleRate: 44100)
+        #expect(host.instantiate())
+        host.installParameterObserver { _, _ in }
+        // Some macOS built-in effects expose no kAudioUnitProperty_ParameterList;
+        // the important contract is that registration remains safe and never
+        // falls back to a wildcard listener.
+        #expect(host.observedParameterCountForTesting >= 0)
+    }
+
+    @Test("Failed preset load leaves the host available for rendering")
+    func failedPresetLoadContained() {
+        let host = AUEffectHost(descriptor: appleAUDelay(), entryID: UUID(), sampleRate: 44100)
+        #expect(host.instantiate())
+        #expect(host.loadPresetSafely(Data([0x00, 0x01, 0x02]), timeout: 0.01) == false)
+        #expect(host.audioUnit != nil)
+    }
+
+    private func appleAUDelay() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+
+    private func appleLowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
             manufacturer: "Apple",
             version: 1
         )

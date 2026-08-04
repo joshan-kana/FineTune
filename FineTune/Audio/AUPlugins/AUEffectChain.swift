@@ -2,6 +2,103 @@ import AudioToolbox
 import Darwin
 import Foundation
 import os
+import Synchronization
+
+/// Lock-free ownership handoff for one immutable render snapshot.
+///
+/// The HAL callback is the only writer of `activeRenders`; the owner of a
+/// snapshot publishes retirement from a non-render context (the main actor
+/// for chains, a utility queue for host state mutation). Publication uses
+/// release stores and callback entry uses acquire loads/CAS. A retiring snapshot rejects new
+/// renders, waits at most `maximumWait`, and is never destroyed until the
+/// active count reaches zero. This keeps the callback allocation-free,
+/// lock-free, and free of blocking calls while ensuring the main actor cannot
+/// wait forever on a third-party Audio Unit.
+final class AUEffectRenderHandoff: @unchecked Sendable {
+    static let maximumWait: TimeInterval = 0.100
+
+    private let retiring = Atomic<Bool>(false)
+    private let activeRenders = Atomic<Int32>(0)
+    private let retirementToken = Atomic<UInt64>(0)
+
+    @inline(__always)
+    func beginRetirement() -> UInt64 {
+        let token = nextToken()
+        retiring.store(true, ordering: .releasing)
+        return token
+    }
+
+    @inline(__always)
+    func cancelRetirement(ifToken token: UInt64) {
+        guard retirementToken.load(ordering: .acquiring) == token else { return }
+        retiring.store(false, ordering: .releasing)
+    }
+
+    @inline(__always)
+    func beginRender() -> Bool {
+        guard !retiring.load(ordering: .acquiring) else { return false }
+        incrementActive()
+        guard !retiring.load(ordering: .acquiring) else {
+            decrementActive()
+            return false
+        }
+        return true
+    }
+
+    @inline(__always)
+    func endRender() {
+        decrementActive()
+    }
+
+    func waitForQuiescence(timeout: TimeInterval = 0.100) -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(max(0, timeout) * 1_000_000_000)
+        while activeRenders.load(ordering: .acquiring) != 0 {
+            if DispatchTime.now().uptimeNanoseconds >= deadline { return false }
+            sched_yield()
+        }
+        return true
+    }
+
+    var activeRenderCount: Int32 { activeRenders.load(ordering: .acquiring) }
+
+    private func nextToken() -> UInt64 {
+        while true {
+            let current = retirementToken.load(ordering: .acquiring)
+            let result = retirementToken.compareExchange(
+                expected: current,
+                desired: current &+ 1,
+                ordering: .acquiringAndReleasing
+            )
+            if result.exchanged { return current &+ 1 }
+        }
+    }
+
+    @inline(__always)
+    private func incrementActive() {
+        while true {
+            let current = activeRenders.load(ordering: .relaxed)
+            let result = activeRenders.compareExchange(
+                expected: current,
+                desired: current &+ 1,
+                ordering: .acquiringAndReleasing
+            )
+            if result.exchanged { return }
+        }
+    }
+
+    @inline(__always)
+    private func decrementActive() {
+        while true {
+            let current = activeRenders.load(ordering: .relaxed)
+            let result = activeRenders.compareExchange(
+                expected: current,
+                desired: current &- 1,
+                ordering: .acquiringAndReleasing
+            )
+            if result.exchanged { return }
+        }
+    }
+}
 
 /// Ordered, immutable Audio Unit chain.
 ///
@@ -18,9 +115,9 @@ final class AUEffectChain: @unchecked Sendable {
     private let hostGroups: [[AUEffectHost]]
     private let hostGroupsByEntryID: [UUID: [AUEffectHost]]
     private let hostGroupsEnabled: [Bool]
+    private let ownerID = UUID()
     private nonisolated(unsafe) var _isBypassed = false
-    private nonisolated(unsafe) var _isRetiring = false
-    private nonisolated(unsafe) var _activeRenderCount: Int32 = 0
+    private let renderHandoff = AUEffectRenderHandoff()
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AUEffectChain")
 
     var isBypassed: Bool { _isBypassed }
@@ -145,10 +242,16 @@ final class AUEffectChain: @unchecked Sendable {
             uniquingKeysWith: { _, latest in latest }
         )
         for (index, group) in groups.enumerated() where !group.isEmpty {
-            AUEffectPeerRegistry.shared.register(group, entryID: entries[index].id)
+            AUEffectPeerRegistry.shared.register(group, entryID: entries[index].id, ownerID: ownerID)
         }
         for host in allHosts { CrashGuard.trackPlugin(host.descriptor.id) }
         logger.info("Created AU chain with \(allHosts.count) host instances for \(self.format.shortLabel)")
+    }
+
+    deinit {
+        for (index, group) in hostGroups.enumerated() where !group.isEmpty {
+            AUEffectPeerRegistry.shared.unregister(group, entryID: entries[index].id, ownerID: ownerID)
+        }
     }
 
     private static func reusableHostGroup(
@@ -180,23 +283,26 @@ final class AUEffectChain: @unchecked Sendable {
         return hasExpectedShape ? previousGroup : nil
     }
 
+    func canReuseHost(for entry: AUEffectChainEntry, format: AudioStreamFormatDescription? = nil) -> Bool {
+        Self.reusableHostGroup(for: entry, in: self, format: format ?? self.format) != nil
+    }
+
     func setBypassed(_ bypassed: Bool) { _isBypassed = bypassed }
 
     /// Prevents this snapshot from starting another Audio Unit render during
     /// replacement. Existing callbacks are allowed to finish; later calls
     /// fail open until the replacement becomes current.
-    func beginRetirement() {
-        OSMemoryBarrier()
-        _isRetiring = true
-        OSMemoryBarrier()
+    @discardableResult
+    func beginRetirement() -> UInt64 {
+        renderHandoff.beginRetirement()
     }
 
-    func waitForRenderQuiescence() {
-        while true {
-            OSMemoryBarrier()
-            if _activeRenderCount == 0 { return }
-            sched_yield()
-        }
+    func cancelRetirement(ifToken token: UInt64) {
+        renderHandoff.cancelRetirement(ifToken: token)
+    }
+
+    func waitForRenderQuiescence(timeout: TimeInterval = 0.100) -> Bool {
+        renderHandoff.waitForQuiescence(timeout: timeout)
     }
 
     func host(for entryID: UUID) -> AUEffectHost? {
@@ -249,7 +355,8 @@ final class AUEffectChain: @unchecked Sendable {
     func processInterleaved(samples: UnsafeMutablePointer<Float>, frameCount: Int) {
         guard !_isBypassed, beginRender() else { return }
         defer { endRender() }
-        for group in hostGroups {
+        for (groupIndex, group) in hostGroups.enumerated() {
+            guard hostGroupsEnabled[groupIndex] else { continue }
             if group.count == 1 { group[0].renderInterleaved(samples: samples, frameCount: frameCount) }
             else if group.count == 2 {
                 group[0].renderChannel(samples: samples, frameCount: frameCount, stride: 2)
@@ -260,20 +367,12 @@ final class AUEffectChain: @unchecked Sendable {
 
     @inline(__always)
     private func beginRender() -> Bool {
-        OSMemoryBarrier()
-        guard !_isRetiring else { return false }
-        OSAtomicIncrement32Barrier(&_activeRenderCount)
-        OSMemoryBarrier()
-        if _isRetiring {
-            OSAtomicDecrement32Barrier(&_activeRenderCount)
-            return false
-        }
-        return true
+        renderHandoff.beginRender()
     }
 
     @inline(__always)
     private func endRender() {
-        OSAtomicDecrement32Barrier(&_activeRenderCount)
+        renderHandoff.endRender()
     }
 
     @inline(__always)
@@ -312,7 +411,22 @@ final class AUEffectPeerRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var coordinators: [UUID: AUEffectPeerCoordinator] = [:]
 
-    func register(_ hosts: [AUEffectHost], entryID: UUID) {
+    #if DEBUG
+    var coordinatorCountForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return coordinators.count
+    }
+
+    func hostCountForTesting(entryID: UUID) -> Int {
+        lock.lock()
+        let coordinator = coordinators[entryID]
+        lock.unlock()
+        return coordinator?.hostCount ?? 0
+    }
+    #endif
+
+    func register(_ hosts: [AUEffectHost], entryID: UUID, ownerID: UUID) {
         guard !hosts.isEmpty else { return }
         let coordinator: AUEffectPeerCoordinator
         lock.lock()
@@ -323,10 +437,52 @@ final class AUEffectPeerRegistry: @unchecked Sendable {
             coordinators[entryID] = coordinator
         }
         lock.unlock()
-        coordinator.register(hosts)
+        coordinator.register(hosts, ownerID: ownerID)
     }
 
+    func unregister(_ hosts: [AUEffectHost], entryID: UUID, ownerID: UUID) {
+        lock.lock()
+        let coordinator = coordinators[entryID]
+        lock.unlock()
+        guard let coordinator else { return }
+        coordinator.unregisterAsync(hosts, ownerID: ownerID) { [weak self, weak coordinator] in
+            guard let self, let coordinator, coordinator.isEmpty else { return }
+            self.lock.lock()
+            if self.coordinators[entryID] === coordinator {
+                self.coordinators.removeValue(forKey: entryID)
+            }
+            self.lock.unlock()
+        }
+    }
+
+    #if DEBUG
+    func unregisterSynchronouslyForTesting(_ hosts: [AUEffectHost], entryID: UUID, ownerID: UUID) {
+        lock.lock()
+        let coordinator = coordinators[entryID]
+        lock.unlock()
+        guard let coordinator else { return }
+        coordinator.unregister(hosts, ownerID: ownerID)
+        if coordinator.isEmpty {
+            lock.lock()
+            if coordinators[entryID] === coordinator {
+                coordinators.removeValue(forKey: entryID)
+            }
+            lock.unlock()
+        }
+    }
+    #endif
+
     func reconcile(entryID: UUID, source: AUEffectHost) {
+        lock.lock()
+        let coordinator = coordinators[entryID]
+        lock.unlock()
+        coordinator?.reconcileAsync(source: source)
+    }
+
+    /// Used only after the owning chain has reached quiescence on a utility
+    /// thread. The synchronous wait is deliberately unavailable to the main
+    /// actor and never runs from the render callback.
+    func reconcileSynchronously(entryID: UUID, source: AUEffectHost) {
         lock.lock()
         let coordinator = coordinators[entryID]
         lock.unlock()
@@ -349,10 +505,11 @@ private final class AUEffectPeerCoordinator: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "FineTune.AUEffectPeerCoordinator", qos: .utility)
     private var hosts: [WeakHost] = []
+    private var owners: [ObjectIdentifier: Set<UUID>] = [:]
     private var suppressed: [ParameterKey: AudioUnitParameterValue] = [:]
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AUEffectPeerCoordinator")
 
-    func register(_ newHosts: [AUEffectHost]) {
+    func register(_ newHosts: [AUEffectHost], ownerID: UUID) {
         queue.sync { [weak self] in
             guard let self else { return }
             self.hosts.removeAll { $0.value == nil }
@@ -363,17 +520,79 @@ private final class AUEffectPeerCoordinator: @unchecked Sendable {
                     self.parameterChanged(from: host, parameter: parameter, value: value)
                 }
             }
+            for host in newHosts {
+                owners[ObjectIdentifier(host), default: []].insert(ownerID)
+            }
+        }
+    }
+
+    func unregister(_ oldHosts: [AUEffectHost], ownerID: UUID) {
+        queue.sync {
+            unregisterOnQueue(oldHosts, ownerID: ownerID)
+        }
+    }
+
+    func unregisterAsync(
+        _ oldHosts: [AUEffectHost],
+        ownerID: UUID,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        queue.async { [weak self] in
+            self?.unregisterOnQueue(oldHosts, ownerID: ownerID)
+            DispatchQueue.global(qos: .utility).async(execute: completion)
+        }
+    }
+
+    private func unregisterOnQueue(_ oldHosts: [AUEffectHost], ownerID: UUID) {
+        for host in oldHosts {
+            let id = ObjectIdentifier(host)
+            owners[id]?.remove(ownerID)
+            if owners[id]?.isEmpty == true {
+                owners.removeValue(forKey: id)
+            }
+        }
+        hosts.removeAll { host in
+            guard let value = host.value else { return true }
+            return owners[ObjectIdentifier(value)] == nil
+        }
+        suppressed = suppressed.filter { key, _ in
+            hosts.contains { weakHost in
+                guard let value = weakHost.value else { return false }
+                return ObjectIdentifier(value) == key.hostID
+            }
+        }
+    }
+
+    var isEmpty: Bool {
+        queue.sync {
+            hosts.removeAll { $0.value == nil }
+            return hosts.isEmpty
+        }
+    }
+
+    var hostCount: Int {
+        queue.sync {
+            hosts.removeAll { $0.value == nil }
+            return hosts.count
+        }
+    }
+
+    func reconcileAsync(source: AUEffectHost) {
+        queue.async { [weak self] in
+            self?.reconcileOnQueue(source: source)
         }
     }
 
     func reconcile(source: AUEffectHost) {
-        queue.sync {
-            hosts.removeAll { $0.value == nil }
-            guard let state = source.savePreset() else { return }
-            for weakHost in hosts {
-                guard let host = weakHost.value, host !== source else { continue }
-                _ = host.loadPreset(state)
-            }
+        queue.sync { reconcileOnQueue(source: source) }
+    }
+
+    private func reconcileOnQueue(source: AUEffectHost) {
+        hosts.removeAll { $0.value == nil }
+        guard let state = source.savePreset() else { return }
+        for weakHost in hosts {
+            guard let host = weakHost.value, host !== source else { continue }
+            _ = host.loadPresetSafely(state)
         }
     }
 

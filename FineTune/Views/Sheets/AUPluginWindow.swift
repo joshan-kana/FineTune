@@ -72,6 +72,10 @@ final class AUPluginWindowManager {
         windows[entryID]?.close()
     }
 
+    func saveWindow(for entryID: UUID) {
+        saveCallbacks[entryID]?()
+    }
+
     func closeAllWindows() {
         for window in Array(windows.values) {
             window.close()
