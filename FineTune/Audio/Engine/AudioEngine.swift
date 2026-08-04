@@ -878,6 +878,7 @@ final class AudioEngine {
     }
 
     private func saveAUHostState(_ host: AUEffectHost, for app: AudioApp, entryID: UUID) {
+        AUEffectPeerRegistry.shared.reconcile(entryID: entryID, source: host)
         guard let presetData = host.savePreset() else { return }
         let id = app.persistenceIdentifier
         if var state = appAU[id], let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
@@ -979,6 +980,7 @@ final class AudioEngine {
     }
 
     private func saveDeviceAUHostState(_ host: AUEffectHost, deviceUID: String, entryID: UUID) {
+        AUEffectPeerRegistry.shared.reconcile(entryID: entryID, source: host)
         guard let presetData = host.savePreset() else { return }
         if var state = deviceAU[deviceUID], let idx = state.entries.firstIndex(where: { $0.id == entryID }) {
             state.entries[idx].presetData = presetData

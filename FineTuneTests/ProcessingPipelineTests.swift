@@ -141,6 +141,49 @@ private func loadRepositorySource(_ relativePath: String) throws -> String {
 @Suite("ProcessTapController — Buffer Mapping")
 struct BufferMappingTests {
 
+    @Test("Grouped buffers preserve cumulative per-channel EQ state")
+    func groupedBuffersUseLogicalOffsets() {
+        let frames = 64
+        let input = TestABL(buffers: [(channels: 8, frames: frames)])
+        let groupedInput = TestABL(buffers: [
+            (channels: 2, frames: frames), (channels: 2, frames: frames),
+            (channels: 2, frames: frames), (channels: 2, frames: frames)
+        ])
+        let output = TestABL(buffers: [(channels: 8, frames: frames)])
+        let groupedOutput = TestABL(buffers: [
+            (channels: 2, frames: frames), (channels: 2, frames: frames),
+            (channels: 2, frames: frames), (channels: 2, frames: frames)
+        ])
+        for frame in 0..<frames {
+            for channel in 0..<8 {
+                let sample = Float(channel + 1) / 10
+                input.data(at: 0)[frame * 8 + channel] = sample
+                groupedInput.data(at: channel / 2)[frame * 2 + channel % 2] = sample
+            }
+        }
+
+        var gains = Array(repeating: Float(0), count: EQSettings.bandCount)
+        gains[0] = 6
+        let settings = EQSettings(bandGains: gains, isEnabled: true)
+        let interleavedEQ = EQProcessor(sampleRate: 44100)
+        interleavedEQ.updateSettings(settings)
+        let groupedEQ = EQProcessor(sampleRate: 44100)
+        groupedEQ.updateSettings(settings)
+        var interleavedVolume: Float = 1
+        var groupedVolume: Float = 1
+
+        processWithDefaults(input: input, output: output, currentVol: &interleavedVolume, eqProc: interleavedEQ)
+        processWithDefaults(input: groupedInput, output: groupedOutput, currentVol: &groupedVolume, eqProc: groupedEQ)
+
+        for frame in 0..<frames {
+            for channel in 0..<8 {
+                let interleaved = output.data(at: 0)[frame * 8 + channel]
+                let grouped = groupedOutput.data(at: channel / 2)[frame * 2 + channel % 2]
+                #expect(abs(interleaved - grouped) < 1e-5)
+            }
+        }
+    }
+
     @Test("Stereo 2ch buffer: direct 1:1 mapping preserves signal")
     func stereoDirectMapping() {
         let frames = 512

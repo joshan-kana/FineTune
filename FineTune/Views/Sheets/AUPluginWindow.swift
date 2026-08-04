@@ -65,7 +65,10 @@ final class AUPluginWindowManager {
         logger.info("Opened AU window for \(pluginName)")
     }
 
-    func closeWindow(for entryID: UUID) {
+    func closeWindow(for entryID: UUID, save: Bool = true) {
+        if !save {
+            saveCallbacks.removeValue(forKey: entryID)
+        }
         windows[entryID]?.close()
     }
 

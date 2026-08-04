@@ -312,24 +312,31 @@ final class ProcessTapController: ProcessTapControlling {
         _currentAUEntries = entries
         let format = currentAUFormat()
         let old = auEffectChain
+        for entry in old?.entries ?? entries {
+            AUPluginWindowManager.shared.closeWindow(for: entry.id, save: false)
+        }
+        old?.beginRetirement()
         let newChain = entries.isEmpty ? nil : AUEffectChain(
             entries: entries,
             sampleRate: format.sampleRate,
             format: format,
             reusing: old
         )
+        old?.waitForRenderQuiescence()
         if old?.isBypassed == true { newChain?.setBypassed(true) }
         auEffectChain = newChain
         updateMaxTailTime()
         if let old { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = old } }
         if secondaryResources.isActive {
             let oldSecondary = secondaryAUEffectChain
+            oldSecondary?.beginRetirement()
             let newSecondary = entries.isEmpty ? nil : AUEffectChain(
                 entries: entries,
                 sampleRate: format.sampleRate,
                 format: format,
                 reusing: oldSecondary
             )
+            oldSecondary?.waitForRenderQuiescence()
             if oldSecondary?.isBypassed == true { newSecondary?.setBypassed(true) }
             secondaryAUEffectChain = newSecondary
             if let oldSecondary { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldSecondary } }
@@ -353,24 +360,31 @@ final class ProcessTapController: ProcessTapControlling {
         _currentDeviceAUEntries = entries
         let format = currentAUFormat()
         let old = deviceAUEffectChain
+        for entry in old?.entries ?? entries {
+            AUPluginWindowManager.shared.closeWindow(for: entry.id, save: false)
+        }
+        old?.beginRetirement()
         let newChain = entries.isEmpty ? nil : AUEffectChain(
             entries: entries,
             sampleRate: format.sampleRate,
             format: format,
             reusing: old
         )
+        old?.waitForRenderQuiescence()
         if old?.isBypassed == true { newChain?.setBypassed(true) }
         deviceAUEffectChain = newChain
         updateMaxTailTime()
         if let old { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = old } }
         if secondaryResources.isActive {
             let oldSecondary = secondaryDeviceAUEffectChain
+            oldSecondary?.beginRetirement()
             let newSecondary = entries.isEmpty ? nil : AUEffectChain(
                 entries: entries,
                 sampleRate: format.sampleRate,
                 format: format,
                 reusing: oldSecondary
             )
+            oldSecondary?.waitForRenderQuiescence()
             if oldSecondary?.isBypassed == true { newSecondary?.setBypassed(true) }
             secondaryDeviceAUEffectChain = newSecondary
             if let oldSecondary { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldSecondary } }
@@ -393,8 +407,10 @@ final class ProcessTapController: ProcessTapControlling {
     private func snapshotChainState(_ chain: AUEffectChain?) -> [AUEffectChainEntry]? {
         guard let chain, !chain.entries.isEmpty else { return nil }
         var entries = chain.entries
-        for host in chain.hosts {
-            guard let preset = host.savePreset(), let index = entries.firstIndex(where: { $0.id == host.entryID }) else { continue }
+        for entry in entries {
+            guard let host = chain.host(for: entry.id) else { continue }
+            AUEffectPeerRegistry.shared.reconcile(entryID: entry.id, source: host)
+            guard let preset = host.savePreset(), let index = entries.firstIndex(where: { $0.id == entry.id }) else { continue }
             entries[index].presetData = preset
             entries[index].selectedFactoryPresetIndex = nil
         }
@@ -405,7 +421,7 @@ final class ProcessTapController: ProcessTapControlling {
         let appTail = auEffectChain?.isBypassed == true ? 0 : (auEffectChain?.maxTailTime ?? 0)
         let deviceTail = deviceAUEffectChain?.isBypassed == true ? 0 : (deviceAUEffectChain?.maxTailTime ?? 0)
         let rate = (try? primaryResources.aggregateDeviceID.readNominalSampleRate()) ?? 48000
-        _maxTailSamples = UInt64(max(appTail, deviceTail) * rate)
+        _maxTailSamples = UInt64((appTail + deviceTail) * rate)
     }
 
     // MARK: - Multi-Device Aggregate Configuration
@@ -1481,8 +1497,11 @@ final class ProcessTapController: ProcessTapControlling {
         let inputBufferCount = inputBuffers.count
         let outputBufferCount = outputBuffers.count
 
+        var logicalChannelOffset = 0
         for outputIndex in 0..<outputBufferCount {
             let outputBuffer = outputBuffers[outputIndex]
+            let channelOffset = min(logicalChannelOffset, 7)
+            logicalChannelOffset += max(1, Int(outputBuffer.mNumberChannels))
             guard let outputData = outputBuffer.mData else { continue }
 
             let inputIndex: Int
@@ -1523,8 +1542,6 @@ final class ProcessTapController: ProcessTapControlling {
 
             let eq = eqProc  // Parameter read — each callback passes its own processor
             let eqCanProcessBuffer = inputChannels == outputChannels && outputChannels <= 8
-            let channelOffset = min(outputIndex, 7)
-
             if inputChannels == outputChannels {
                 let sampleCount = frameCount * inputChannels
                 for frame in 0..<frameCount {
@@ -1616,7 +1633,10 @@ final class ProcessTapController: ProcessTapControlling {
         }
 
         // Loudness and limiting are deliberately after both AU chains.
-        for (outputIndex, outputBuffer) in outputBuffers.enumerated() {
+        var loudnessChannelOffset = 0
+        for outputBuffer in outputBuffers {
+            let channelOffset = min(loudnessChannelOffset, 7)
+            loudnessChannelOffset += max(1, Int(outputBuffer.mNumberChannels))
             guard let outputData = outputBuffer.mData else { continue }
             let outputSamples = outputData.assumingMemoryBound(to: Float.self)
             let outputChannels = max(1, Int(outputBuffer.mNumberChannels))
@@ -1627,7 +1647,7 @@ final class ProcessTapController: ProcessTapControlling {
                 loudnessEqualizerProc.process(input: UnsafePointer(outputSamples), output: outputSamples, frameCount: frameCount, channelCount: outputChannels)
             }
             if let loudnessCompensatorProc, loudnessCompensatorProc.isEnabled, outputChannels <= 8 {
-                loudnessCompensatorProc.process(input: UnsafePointer(outputSamples), output: outputSamples, frameCount: frameCount, channelCount: outputChannels, channelOffset: min(outputIndex, 7))
+                loudnessCompensatorProc.process(input: UnsafePointer(outputSamples), output: outputSamples, frameCount: frameCount, channelCount: outputChannels, channelOffset: channelOffset)
             }
             SoftLimiter.processBuffer(outputSamples, sampleCount: outputSampleCount)
         }
