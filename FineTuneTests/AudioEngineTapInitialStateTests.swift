@@ -57,6 +57,8 @@ final class RecordingProcessTapController: ProcessTapControlling {
     private(set) var pendingAppAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
     private(set) var pendingDeviceAUCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
     private(set) var pendingDevicePrepareCompletions: [@MainActor @Sendable (AUChainUpdateResult) -> Void] = []
+    private(set) var devicePrepareRequestCount = 0
+    private(set) var preparedDeviceEntries: [[AUEffectChainEntry]] = []
     private(set) var publishedDeviceEntries: [[AUEffectChainEntry]] = []
     private(set) var abortedDeviceTokenIDs: [UUID] = []
     var deferDevicePrepares = false
@@ -140,6 +142,8 @@ final class RecordingProcessTapController: ProcessTapControlling {
         requestGeneration: UInt64,
         completion: @escaping @MainActor @Sendable (AUChainPreparationResult) -> Void
     ) {
+        devicePrepareRequestCount += 1
+        preparedDeviceEntries.append(entries)
         let token = AUChainPreparedToken(
             requestGeneration: requestGeneration,
             tapIdentity: auTransactionOwnerID,
@@ -808,6 +812,183 @@ struct DeviceAUChainTransactionCoordinatorTests {
         )
         #expect(abortToken.abort())
         #expect(!abortToken.abort())
+    }
+
+    @Test("A tap enrolled during prepare joins before commit")
+    func enrollmentWaitsForNewTap() {
+        let taps = makeCoordinatorTaps()
+        taps[0].deferDevicePrepares = true
+        taps[1].deferDevicePrepares = true
+        let result = CoordinatorResultBox()
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 8,
+            entries: entries(),
+            participants: [10001: taps[0]],
+            onCommitted: { result.committed += 1 },
+            onRejected: { result.rejected.append($0) }
+        )
+
+        #expect(coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+        taps[0].completeNextDevicePrepare()
+        #expect(result.committed == 0)
+        taps[1].completeNextDevicePrepare()
+
+        #expect(result.committed == 1)
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.count == 1 })
+        #expect(taps[0].preparedDeviceEntries == taps[1].preparedDeviceEntries)
+    }
+
+    @Test("A newly enrolled timeout aborts all prepared tokens")
+    func enrolledTimeoutAbortsAll() {
+        let taps = makeCoordinatorTaps()
+        taps[0].deferDevicePrepares = true
+        taps[1].deferDevicePrepares = true
+        let result = CoordinatorResultBox()
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 8,
+            entries: entries(),
+            participants: [10001: taps[0]],
+            onCommitted: { result.committed += 1 },
+            onRejected: { result.rejected.append($0) }
+        )
+        #expect(coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+
+        taps[0].completeNextDevicePrepare()
+        taps[1].completeNextDevicePrepare(.rejected(reason: .timedOut))
+
+        #expect(result.committed == 0)
+        #expect(result.rejected == [.rejected(reason: .timedOut)])
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.isEmpty })
+        #expect(taps[0].abortedDeviceTokenIDs.count == 1)
+    }
+
+    @Test("A disappearing enrolled tap aborts the transaction")
+    func enrolledDisappearanceAbortsAll() {
+        let taps = makeCoordinatorTaps()
+        taps[0].deferDevicePrepares = true
+        taps[1].deferDevicePrepares = true
+        let result = CoordinatorResultBox()
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 8,
+            entries: entries(),
+            participants: [10001: taps[0]],
+            onCommitted: { result.committed += 1 },
+            onRejected: { result.rejected.append($0) }
+        )
+        #expect(coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+        taps[0].completeNextDevicePrepare()
+        coordinator.tapDidDisappear(taps[1])
+
+        #expect(result.committed == 0)
+        #expect(result.rejected == [.superseded])
+        #expect(taps.allSatisfy { $0.publishedDeviceEntries.isEmpty })
+        #expect(taps[0].abortedDeviceTokenIDs.count == 1)
+    }
+
+    @Test("A tap cannot be enrolled twice or for another device")
+    func enrollmentIdentityAndDeviceGuards() {
+        let taps = makeCoordinatorTaps()
+        taps[0].deferDevicePrepares = true
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 8,
+            entries: entries(),
+            participants: [10001: taps[0]],
+            onCommitted: {},
+            onRejected: { _ in }
+        )
+
+        #expect(!coordinator.enroll(taps[0], pid: 10001, forDeviceUID: "uid-test"))
+        #expect(!coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "other-device"))
+        #expect(coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+        #expect(!coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+        #expect(taps[1].devicePrepareRequestCount == 1)
+    }
+
+    @Test("Enrollment is refused after synchronous commit")
+    func enrollmentRefusedAfterCommit() {
+        let taps = makeCoordinatorTaps()
+        let result = CoordinatorResultBox()
+        let coordinator = DeviceAUChainTransactionCoordinator()
+        coordinator.begin(
+            deviceUID: "uid-test",
+            generation: 8,
+            entries: entries(),
+            participants: [10001: taps[0]],
+            onCommitted: { result.committed += 1 },
+            onRejected: { result.rejected.append($0) }
+        )
+
+        #expect(result.committed == 1)
+        #expect(!coordinator.enroll(taps[1], pid: 10002, forDeviceUID: "uid-test"))
+        #expect(taps[1].devicePrepareRequestCount == 0)
+    }
+}
+
+@Suite("AudioEngine device AU enrollment")
+@MainActor
+struct AudioEngineDeviceAUEnrollmentTests {
+    @Test("A tap created during prepare is enrolled and commits with its peers")
+    func newTapJoinsPendingDeviceTransaction() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let firstTap = try #require(fix.lastTap())
+        firstTap.deferDevicePrepares = true
+        fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: enrollmentTestPlugin())
+
+        let newApp = AudioApp(
+            id: 12347,
+            processObjectIDs: [],
+            name: "EnrolledApp",
+            icon: NSImage(),
+            bundleID: "com.test.tapinitial.enrolled"
+        )
+        fix.engine.setDevice(for: newApp, deviceUID: fix.device.uid)
+        let secondTap = try #require(fix.allTaps().last)
+        #expect(secondTap.devicePrepareRequestCount == 1)
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).isEmpty)
+
+        firstTap.completeNextDevicePrepare()
+
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid).count == 1)
+        #expect(fix.settings.getDeviceAUEffectChain(for: fix.device.uid).count == 1)
+        #expect(firstTap.publishedDeviceEntries.count == 1)
+        #expect(secondTap.publishedDeviceEntries.count == 1)
+
+        let postCommitApp = AudioApp(
+            id: 12348,
+            processObjectIDs: [],
+            name: "PostCommitApp",
+            icon: NSImage(),
+            bundleID: "com.test.tapinitial.postcommit"
+        )
+        fix.engine.setDevice(for: postCommitApp, deviceUID: fix.device.uid)
+        let postCommitTap = try #require(fix.allTaps().last)
+        #expect(postCommitTap.devicePrepareRequestCount == 0)
+        #expect(postCommitTap.events.contains { event in
+            if case .updateDeviceAUEffectChain(let entries) = event {
+                return entries.count == 1
+            }
+            return false
+        })
+    }
+
+    private func enrollmentTestPlugin() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
     }
 }
 

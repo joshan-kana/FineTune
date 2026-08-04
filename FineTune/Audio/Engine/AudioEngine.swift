@@ -16,12 +16,24 @@ private struct PendingDeviceAUState {
 
 @MainActor
 final class DeviceAUChainTransactionCoordinator {
+    private struct ParticipantID: Hashable {
+        let pid: pid_t
+        let tapIdentity: UUID
+    }
+
     private final class Request {
+        enum Phase {
+            case preparing
+            case committing
+            case finished
+        }
+
         let deviceUID: String
         let generation: UInt64
         let entries: [AUEffectChainEntry]
-        let participants: [pid_t: any ProcessTapControlling]
-        var prepared: [pid_t: AUChainPreparedToken] = [:]
+        var phase: Phase = .preparing
+        var participants: [ParticipantID: any ProcessTapControlling]
+        var prepared: [ParticipantID: AUChainPreparedToken] = [:]
         let onCommitted: @MainActor () -> Void
         let onRejected: @MainActor (AUChainUpdateResult) -> Void
 
@@ -29,7 +41,7 @@ final class DeviceAUChainTransactionCoordinator {
             deviceUID: String,
             generation: UInt64,
             entries: [AUEffectChainEntry],
-            participants: [pid_t: any ProcessTapControlling],
+            participants: [ParticipantID: any ProcessTapControlling],
             onCommitted: @escaping @MainActor () -> Void,
             onRejected: @escaping @MainActor (AUChainUpdateResult) -> Void
         ) {
@@ -53,15 +65,19 @@ final class DeviceAUChainTransactionCoordinator {
         onRejected: @escaping @MainActor (AUChainUpdateResult) -> Void
     ) {
         if let previous = requests.removeValue(forKey: deviceUID) {
+            previous.phase = .finished
             abort(previous)
             previous.onRejected(.superseded)
         }
 
+        let participantMap = Dictionary(uniqueKeysWithValues: participants.map { pid, tap in
+            (ParticipantID(pid: pid, tapIdentity: tap.auTransactionOwnerID), tap)
+        })
         let request = Request(
             deviceUID: deviceUID,
             generation: generation,
             entries: entries,
-            participants: participants,
+            participants: participantMap,
             onCommitted: onCommitted,
             onRejected: onRejected
         )
@@ -73,33 +89,69 @@ final class DeviceAUChainTransactionCoordinator {
             return
         }
 
-        for (pid, tap) in participants {
-            tap.prepareDeviceAUEffectChain(entries, requestGeneration: generation) { [weak self] result in
-                self?.prepared(deviceUID: deviceUID, generation: generation, pid: pid, tap: tap, result: result)
-            }
+        for (participantID, tap) in participantMap {
+            prepare(tap, participantID: participantID, request: request)
         }
     }
 
+    @discardableResult
+    func enroll(
+        _ tap: any ProcessTapControlling,
+        pid: pid_t,
+        forDeviceUID deviceUID: String
+    ) -> Bool {
+        guard let request = requests[deviceUID], request.phase == .preparing,
+              tap.currentDeviceUIDs.contains(deviceUID) else { return false }
+        let participantID = ParticipantID(pid: pid, tapIdentity: tap.auTransactionOwnerID)
+        guard !request.participants.keys.contains(participantID),
+              !request.participants.values.contains(where: { $0.auTransactionOwnerID == tap.auTransactionOwnerID }) else {
+            return false
+        }
+        request.participants[participantID] = tap
+        prepare(tap, participantID: participantID, request: request)
+        return true
+    }
+
     func tapDidDisappear(_ tap: any ProcessTapControlling) {
-        for request in Array(requests.values) where request.participants.values.contains(where: { $0.auTransactionOwnerID == tap.auTransactionOwnerID }) {
+        for request in Array(requests.values)
+        where request.phase == .preparing &&
+            request.participants.values.contains(where: { $0.auTransactionOwnerID == tap.auTransactionOwnerID }) {
             fail(request, result: .superseded)
         }
     }
 
     func cancel(deviceUID: String) {
         guard let request = requests.removeValue(forKey: deviceUID) else { return }
+        request.phase = .finished
         abort(request)
         request.onRejected(.superseded)
+    }
+
+    private func prepare(
+        _ tap: any ProcessTapControlling,
+        participantID: ParticipantID,
+        request: Request
+    ) {
+        tap.prepareDeviceAUEffectChain(request.entries, requestGeneration: request.generation) { [weak self] result in
+            self?.prepared(
+                deviceUID: request.deviceUID,
+                generation: request.generation,
+                participantID: participantID,
+                tap: tap,
+                result: result
+            )
+        }
     }
 
     private func prepared(
         deviceUID: String,
         generation: UInt64,
-        pid: pid_t,
+        participantID: ParticipantID,
         tap: any ProcessTapControlling,
         result: AUChainPreparationResult
     ) {
-        guard let request = requests[deviceUID], request.generation == generation else {
+        guard let request = requests[deviceUID], request.generation == generation,
+              request.phase == .preparing else {
             if case .prepared(let token) = result {
                 tap.abortPreparedDeviceAUEffectChain(token)
             }
@@ -108,14 +160,14 @@ final class DeviceAUChainTransactionCoordinator {
 
         switch result {
         case .prepared(let token):
-            guard request.participants[pid]?.auTransactionOwnerID == tap.auTransactionOwnerID,
+            guard request.participants[participantID]?.auTransactionOwnerID == tap.auTransactionOwnerID,
                   token.requestGeneration == generation,
                   token.tapIdentity == tap.auTransactionOwnerID else {
                 tap.abortPreparedDeviceAUEffectChain(token)
                 fail(request, result: .superseded)
                 return
             }
-            request.prepared[pid] = token
+            request.prepared[participantID] = token
             guard request.prepared.count == request.participants.count else { return }
             commit(request)
         case .rejected(let reason):
@@ -126,12 +178,14 @@ final class DeviceAUChainTransactionCoordinator {
     }
 
     private func commit(_ request: Request) {
-        guard requests[request.deviceUID] === request else { return }
+        guard requests[request.deviceUID] === request, request.phase == .preparing else { return }
+        request.phase = .committing
 
         var claimed: [(any ProcessTapControlling, AUChainPreparedToken)] = []
-        for (pid, tap) in request.participants {
-            guard let token = request.prepared[pid],
+        for (participantID, tap) in request.participants {
+            guard let token = request.prepared[participantID],
                   tap.claimPreparedDeviceAUEffectChain(token, requestGeneration: request.generation) else {
+                request.phase = .finished
                 abort(request)
                 requests.removeValue(forKey: request.deviceUID)
                 request.onRejected(.superseded)
@@ -145,20 +199,22 @@ final class DeviceAUChainTransactionCoordinator {
         for (tap, token) in claimed {
             tap.commitClaimedDeviceAUEffectChain(token)
         }
+        request.phase = .finished
         requests.removeValue(forKey: request.deviceUID)
         request.onCommitted()
     }
 
     private func fail(_ request: Request, result: AUChainUpdateResult) {
-        guard requests[request.deviceUID] === request else { return }
+        guard requests[request.deviceUID] === request, request.phase == .preparing else { return }
+        request.phase = .finished
         requests.removeValue(forKey: request.deviceUID)
         abort(request)
         request.onRejected(result)
     }
 
     private func abort(_ request: Request) {
-        for (pid, token) in request.prepared {
-            request.participants[pid]?.abortPreparedDeviceAUEffectChain(token)
+        for (participantID, token) in request.prepared {
+            request.participants[participantID]?.abortPreparedDeviceAUEffectChain(token)
         }
         request.prepared.removeAll()
     }
@@ -1387,6 +1443,15 @@ final class AudioEngine {
         }
     }
 
+    @discardableResult
+    private func enrollNewTapInPendingDeviceTransactions(
+        _ tap: any ProcessTapControlling,
+        pid: pid_t,
+        deviceUIDs: [String]
+    ) -> Set<String> {
+        Set(deviceUIDs.filter { deviceAUCoordinator.enroll(tap, pid: pid, forDeviceUID: $0) })
+    }
+
     private func applyAutoEQToTap(_ tap: any ProcessTapControlling) {
         guard let deviceUID = tap.currentDeviceUID else { return }
 
@@ -1617,10 +1682,21 @@ final class AudioEngine {
             )
             try tap.activate(initial: initial)
             taps[app.id] = tap
+            let enrolledDeviceUIDs = enrollNewTapInPendingDeviceTransactions(tap, pid: app.id, deviceUIDs: deviceUIDs)
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
             if initial.autoEQProfile == nil {
                 applyAutoEQToTap(tap)
+            }
+
+            for deviceUID in deviceUIDs where !enrolledDeviceUIDs.contains(deviceUID) {
+                let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
+                guard !savedDeviceAU.isEmpty else { continue }
+                tap.updateDeviceAUEffectChain(savedDeviceAU) { [weak self] result in
+                    guard let self, case .committed = result else { return }
+                    self.deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
+                    self.syncDeviceAUFailedIDs(for: deviceUID)
+                }
             }
 
             logger.debug("Created tap for \(app.name) on \(deviceUIDs.count) device(s)")
@@ -1779,6 +1855,7 @@ final class AudioEngine {
             )
             try tap.activate(initial: initial)
             taps[app.id] = tap
+            let enrolledDeviceUIDs = enrollNewTapInPendingDeviceTransactions(tap, pid: app.id, deviceUIDs: [deviceUID])
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
             // Imported profiles always hit the synchronous path above.
@@ -1796,7 +1873,7 @@ final class AudioEngine {
                 }
             }
             let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
-            if !savedDeviceAU.isEmpty {
+            if !savedDeviceAU.isEmpty && !enrolledDeviceUIDs.contains(deviceUID) {
                 tap.updateDeviceAUEffectChain(savedDeviceAU) { [weak self] result in
                     guard let self, case .committed = result else { return }
                     self.deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
