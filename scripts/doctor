@@ -48,7 +48,7 @@ info "upstream: ${upstream:-missing}"
 
 if [[ "$(uname -s)" == Darwin ]]; then
     if (require_full_xcode) 2>"$doctor_tmp/xcode-error"; then
-        info "Xcode: $(xcodebuild -version | head -1)"
+        info "Xcode: $(xcodebuild_host -version | head -1)"
         info "SDK: $(xcrun --sdk macosx --show-sdk-path)"
     else
         warn "$(sed -n '1p' "$doctor_tmp/xcode-error")"
