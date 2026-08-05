@@ -110,6 +110,7 @@ final class AUEffectChain: @unchecked Sendable {
     let failedEntryIDs: Set<UUID>
     let unsupportedEntryIDs: Set<UUID>
     let format: AudioStreamFormatDescription
+    let topologies: [AUProcessingTopology]
 
     private let _hosts: [AUEffectHost]
     private let hostGroups: [[AUEffectHost]]
@@ -148,6 +149,7 @@ final class AUEffectChain: @unchecked Sendable {
         var allHosts: [AUEffectHost] = []
         var groups: [[AUEffectHost]] = []
         var enabledGroups: [Bool] = []
+        var selectedTopologies: [AUProcessingTopology] = []
         var failed = Set<UUID>()
         var unsupported = Set<UUID>()
 
@@ -160,6 +162,7 @@ final class AUEffectChain: @unchecked Sendable {
                reusableGroup.first?.format == self.format {
                 groups.append(reusableGroup)
                 enabledGroups.append(entry.isEnabled)
+                selectedTopologies.append(previousChain?.topology(for: entry.id) ?? .native)
                 allHosts.append(contentsOf: reusableGroup)
                 if reusableGroup.count == 1, !reusableGroup[0].canProcessCurrentLayout {
                     unsupported.insert(entry.id)
@@ -186,7 +189,8 @@ final class AUEffectChain: @unchecked Sendable {
                 mode: entry.processingMode,
                 channelCount: self.format.channelCount,
                 nativeCanProcess: nativeInstantiated && native.canProcessCurrentLayout,
-                supportedChannelCounts: native.supportedChannelCounts
+                supportedChannelCounts: native.supportedChannelCounts,
+                hasFrontStereoPair: self.format.frontStereoChannelIndices != nil
             )
 
             if topology == .independentPerChannel && self.format.channelCount > 1 {
@@ -225,9 +229,46 @@ final class AUEffectChain: @unchecked Sendable {
                     }
                     groups.append(monos)
                     enabledGroups.append(entry.isEnabled)
+                    selectedTopologies.append(.independentPerChannel)
                     allHosts.append(contentsOf: monos)
                     continue
                 }
+            }
+
+            if topology == .frontStereoPassThrough,
+               self.format.frontStereoChannelIndices != nil {
+                let stereoFormat = AudioStreamFormatDescription(
+                    sampleRate: self.format.sampleRate,
+                    frameCapacity: self.format.frameCapacity,
+                    channelCount: 2,
+                    isInterleaved: false,
+                    channelLayoutTag: kAudioChannelLayoutTag_Stereo
+                )
+                let stereoHost = AUEffectHost(
+                    descriptor: entry.pluginDescriptor,
+                    entryID: entry.id,
+                    sampleRate: self.format.sampleRate,
+                    maxFrames: maxFrames,
+                    enabled: entry.isEnabled,
+                    format: stereoFormat,
+                    processingMode: .stereoOnly
+                )
+                if stereoHost.instantiate(), stereoHost.canProcessCurrentLayout {
+                    if let preset = entry.presetData {
+                        _ = stereoHost.loadPreset(preset)
+                    } else if let index = entry.selectedFactoryPresetIndex {
+                        _ = stereoHost.selectFactoryPreset(index: index)
+                    }
+                    groups.append([stereoHost])
+                    enabledGroups.append(entry.isEnabled)
+                    selectedTopologies.append(.frontStereoPassThrough)
+                    allHosts.append(stereoHost)
+                    continue
+                }
+                // Keep the native instance, if any, only long enough for its
+                // state to be released. A rejected stereo fallback is a
+                // visible unsupported entry and remains fail-open.
+                unsupported.insert(entry.id)
             }
 
             if !nativeInstantiated || topology == .unsupported || !native.canProcessCurrentLayout {
@@ -241,11 +282,15 @@ final class AUEffectChain: @unchecked Sendable {
                 }
                 groups.append([native])
                 enabledGroups.append(entry.isEnabled)
+                selectedTopologies.append(
+                    topology == .native && native.canProcessCurrentLayout ? .native : .unsupported
+                )
                 allHosts.append(native)
             } else {
                 failed.insert(entry.id)
                 groups.append([])
                 enabledGroups.append(false)
+                selectedTopologies.append(.unsupported)
             }
         }
 
@@ -253,6 +298,7 @@ final class AUEffectChain: @unchecked Sendable {
         // fail-open, but the UI must not imply that the AU is processing.
         self.failedEntryIDs = failed.union(unsupported)
         self.unsupportedEntryIDs = unsupported
+        self.topologies = selectedTopologies
         self._hosts = allHosts
         self.hostGroups = groups
         self.hostGroupsEnabled = enabledGroups
@@ -343,6 +389,22 @@ final class AUEffectChain: @unchecked Sendable {
         hostGroupsByEntryID[entryID] ?? []
     }
 
+    func topology(for entryID: UUID) -> AUProcessingTopology {
+        guard let index = entries.firstIndex(where: { $0.id == entryID }), index < topologies.count else {
+            return .unsupported
+        }
+        return topologies[index]
+    }
+
+    func topologyDescription(for entryID: UUID) -> String {
+        switch topology(for: entryID) {
+        case .native: return format.isMultichannel ? "Native multichannel" : "Native stereo"
+        case .independentPerChannel: return "Independent mono hosts ×\(format.channelCount)"
+        case .frontStereoPassThrough: return "Front L/R stereo • other channels unchanged"
+        case .unsupported: return "Unsupported layout • audio preserved"
+        }
+    }
+
     func isEntryEnabled(_ entryID: UUID) -> Bool {
         guard let index = entries.firstIndex(where: { $0.id == entryID }) else { return false }
         return hostGroupsEnabled[index]
@@ -371,7 +433,14 @@ final class AUEffectChain: @unchecked Sendable {
         var groupIndex = 0
         for group in hostGroups {
             guard !group.isEmpty, hostGroupsEnabled[groupIndex] else { groupIndex += 1; continue }
-            if group.count == 1 {
+            if topologies[groupIndex] == .frontStereoPassThrough,
+               let channelIndices = format.frontStereoChannelIndices {
+                group[0].renderFrontStereo(
+                    buffers: buffers,
+                    frameCount: frameCount,
+                    channelIndices: channelIndices
+                )
+            } else if group.count == 1 {
                 group[0].renderBuffers(buffers, frameCount: frameCount)
             } else {
                 processIndependent(group, buffers: buffers, frameCount: frameCount)

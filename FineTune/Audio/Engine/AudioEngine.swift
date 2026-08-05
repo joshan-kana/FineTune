@@ -1126,6 +1126,11 @@ final class AudioEngine {
         return host.factoryPresets
     }
 
+    func getAUProcessingTopologyDescriptions(for app: AudioApp) -> [UUID: String] {
+        guard let tap = taps[app.id] as? ProcessTapController else { return [:] }
+        return tap.auEffectChainTopologyDescriptions
+    }
+
     private func commitAppAU(_ state: AUChainState, for app: AudioApp, onCommitted: @escaping @MainActor @Sendable () -> Void = {}) {
         let id = app.persistenceIdentifier
         if pendingAppAU[id] != nil {
@@ -1250,6 +1255,15 @@ final class AudioEngine {
             }
         }
         return []
+    }
+
+    func getDeviceAUProcessingTopologyDescriptions(deviceUID: String) -> [UUID: String] {
+        for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
+            if let tap = tap as? ProcessTapController {
+                return tap.deviceAUEffectChainTopologyDescriptions
+            }
+        }
+        return [:]
     }
 
     func setDeviceAUChainBypassed(deviceUID: String, bypassed: Bool) {

@@ -49,6 +49,7 @@ struct AppRow: View {
     let onOpenAUUI: (UUID) -> Void
     let onOpenAUGenericUI: (UUID) -> Void
     let auFailedEntryIDs: Set<UUID>
+    let auTopologyDescriptions: [UUID: String]
     let getAUFactoryPresets: (UUID) -> [(index: Int, name: String)]
     let onSelectAUFactoryPreset: (UUID, Int) -> Void
 
@@ -99,6 +100,7 @@ struct AppRow: View {
         onOpenAUUI: @escaping (UUID) -> Void = { _ in },
         onOpenAUGenericUI: @escaping (UUID) -> Void = { _ in },
         auFailedEntryIDs: Set<UUID> = [],
+        auTopologyDescriptions: [UUID: String] = [:],
         getAUFactoryPresets: @escaping (UUID) -> [(index: Int, name: String)] = { _ in [] },
         onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in }
     ) {
@@ -145,6 +147,7 @@ struct AppRow: View {
         self.onOpenAUUI = onOpenAUUI
         self.onOpenAUGenericUI = onOpenAUGenericUI
         self.auFailedEntryIDs = auFailedEntryIDs
+        self.auTopologyDescriptions = auTopologyDescriptions
         self.getAUFactoryPresets = getAUFactoryPresets
         self.onSelectAUFactoryPreset = onSelectAUFactoryPreset
         // Initialize local EQ state for reactive UI updates
@@ -264,6 +267,7 @@ struct AppRow: View {
                     onOpenUI: onOpenAUUI,
                     onOpenGenericUI: onOpenAUGenericUI,
                     failedEntryIDs: auFailedEntryIDs,
+                    topologyDescriptions: auTopologyDescriptions,
                     getFactoryPresets: getAUFactoryPresets,
                     onSelectFactoryPreset: onSelectAUFactoryPreset
                 )

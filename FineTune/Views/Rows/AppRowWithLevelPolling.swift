@@ -49,6 +49,7 @@ struct AppRowWithLevelPolling: View {
     let onOpenAUUI: (UUID) -> Void
     let onOpenAUGenericUI: (UUID) -> Void
     let auFailedEntryIDs: Set<UUID>
+    let auTopologyDescriptions: [UUID: String]
     let getAUFactoryPresets: (UUID) -> [(index: Int, name: String)]
     let onSelectAUFactoryPreset: (UUID, Int) -> Void
 
@@ -100,6 +101,7 @@ struct AppRowWithLevelPolling: View {
         onOpenAUUI: @escaping (UUID) -> Void = { _ in },
         onOpenAUGenericUI: @escaping (UUID) -> Void = { _ in },
         auFailedEntryIDs: Set<UUID> = [],
+        auTopologyDescriptions: [UUID: String] = [:],
         getAUFactoryPresets: @escaping (UUID) -> [(index: Int, name: String)] = { _ in [] },
         onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in }
     ) {
@@ -147,6 +149,7 @@ struct AppRowWithLevelPolling: View {
         self.onOpenAUUI = onOpenAUUI
         self.onOpenAUGenericUI = onOpenAUGenericUI
         self.auFailedEntryIDs = auFailedEntryIDs
+        self.auTopologyDescriptions = auTopologyDescriptions
         self.getAUFactoryPresets = getAUFactoryPresets
         self.onSelectAUFactoryPreset = onSelectAUFactoryPreset
     }
@@ -196,6 +199,7 @@ struct AppRowWithLevelPolling: View {
             onOpenAUUI: onOpenAUUI,
             onOpenAUGenericUI: onOpenAUGenericUI,
             auFailedEntryIDs: auFailedEntryIDs,
+            auTopologyDescriptions: auTopologyDescriptions,
             getAUFactoryPresets: getAUFactoryPresets,
             onSelectAUFactoryPreset: onSelectAUFactoryPreset
         )

@@ -431,6 +431,10 @@ final class ProcessTapController: ProcessTapControlling {
 
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { _currentAUEntries }
     var auEffectChainFailedIDs: Set<UUID> { auEffectChain?.failedEntryIDs ?? [] }
+    var auEffectChainTopologyDescriptions: [UUID: String] {
+        guard let chain = auEffectChain else { return [:] }
+        return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
+    }
     func auEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(auEffectChain) }
     func getAUHost(for entryID: UUID) -> AUEffectHost? { auEffectChain?.host(for: entryID) }
 
@@ -611,6 +615,10 @@ final class ProcessTapController: ProcessTapControlling {
 
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { _currentDeviceAUEntries }
     var deviceAUEffectChainFailedIDs: Set<UUID> { deviceAUEffectChain?.failedEntryIDs ?? [] }
+    var deviceAUEffectChainTopologyDescriptions: [UUID: String] {
+        guard let chain = deviceAUEffectChain else { return [:] }
+        return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
+    }
     func deviceAUEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(deviceAUEffectChain) }
     func getDeviceAUHost(for entryID: UUID) -> AUEffectHost? { deviceAUEffectChain?.host(for: entryID) }
 

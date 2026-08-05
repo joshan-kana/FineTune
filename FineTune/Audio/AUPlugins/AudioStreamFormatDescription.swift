@@ -138,6 +138,16 @@ struct AudioStreamFormatDescription: Equatable, Sendable {
 
     var isMultichannel: Bool { channelCount > 2 }
 
+    /// The front stereo pair in the semantic layout order. A multichannel
+    /// format is only eligible for the stereo-only fallback when these roles
+    /// are present; channel count alone must never make centre/LFE a pair.
+    var frontStereoChannelIndices: (left: Int, right: Int)? {
+        guard let left = channelRoles.firstIndex(of: .left),
+              let right = channelRoles.firstIndex(of: .right),
+              left != right else { return nil }
+        return (left, right)
+    }
+
     var shortLabel: String {
         switch channelCount {
         case 1: return "Mono"

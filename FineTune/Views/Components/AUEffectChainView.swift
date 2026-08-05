@@ -15,6 +15,7 @@ struct AUEffectChainView: View {
     let onOpenUI: (UUID) -> Void
     var onOpenGenericUI: ((UUID) -> Void)? = nil
     var failedEntryIDs: Set<UUID> = []
+    var topologyDescriptions: [UUID: String] = [:]
     var getFactoryPresets: ((UUID) -> [(index: Int, name: String)])? = nil
     var onSelectFactoryPreset: ((UUID, Int) -> Void)? = nil
 
@@ -81,7 +82,7 @@ struct AUEffectChainView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(entry.isEnabled ? DesignTokens.Colors.textPrimary : DesignTokens.Colors.textTertiary)
                             .lineLimit(1)
-                        Text(processingModeLabel(entry))
+                        Text(topologyDescriptions[entry.id] ?? processingModeLabel(entry))
                             .font(.system(size: 8))
                             .foregroundStyle(DesignTokens.Colors.textTertiary)
                             .lineLimit(1)

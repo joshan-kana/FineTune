@@ -357,8 +357,8 @@ struct AUProcessingTopologyTests {
         )
     }
 
-    @Test("A mock stereo-only AU stays visibly unsupported when mono is unavailable")
-    func rejectsUnsupportedFallback() {
+    @Test("A stereo-only AU uses the front stereo pass-through on multichannel output")
+    func selectsFrontStereoPassThrough() {
         let mockCapabilities = [(input: 2, output: 2)]
         #expect(
             AUProcessingTopology.choose(
@@ -366,8 +366,142 @@ struct AUProcessingTopologyTests {
                 channelCount: 8,
                 nativeCanProcess: false,
                 supportedChannelCounts: mockCapabilities
+            ) == .frontStereoPassThrough
+        )
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 6,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities,
+                hasFrontStereoPair: false
             ) == .unsupported
         )
+    }
+
+    @Test("Explicit modes are not silently replaced by the stereo fallback")
+    func preservesExplicitModes() {
+        let stereoOnly = [(input: 2, output: 2)]
+        #expect(AUProcessingTopology.choose(mode: .nativeMultichannel, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(mode: .stereoOnly, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(mode: .bypassForLayout, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+    }
+}
+
+@Suite("Front stereo multichannel routing")
+struct FrontStereoRoutingTests {
+    @Test("An 8-channel output processes only front L/R")
+    func sevenOnePreservesRemainingChannels() throws {
+        try assertFrontStereoRouting(channelCount: 8)
+    }
+
+    @Test("A 5.1 output does not pair centre or LFE")
+    func fiveOnePreservesCentreLFEAndSurrounds() throws {
+        try assertFrontStereoRouting(channelCount: 6)
+    }
+
+    private func assertFrontStereoRouting(channelCount: Int) throws {
+        let format = AudioStreamFormatDescription(
+            sampleRate: 44_100,
+            frameCapacity: 256,
+            channelCount: channelCount,
+            isInterleaved: true
+        )
+        let indices = try #require(format.frontStereoChannelIndices)
+        let host = AUEffectHost(
+            descriptor: lowPassFilter(),
+            entryID: UUID(),
+            sampleRate: format.sampleRate,
+            maxFrames: format.frameCapacity,
+            format: AudioStreamFormatDescription(
+                sampleRate: format.sampleRate,
+                frameCapacity: format.frameCapacity,
+                channelCount: 2,
+                isInterleaved: false,
+                channelLayoutTag: kAudioChannelLayoutTag_Stereo
+            ),
+            processingMode: .stereoOnly
+        )
+        #expect(host.instantiate())
+        guard let au = host.audioUnit else { return }
+        AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 100, 0)
+
+        let frameCount = 256
+        let abl = FrontStereoTestABL(channels: channelCount, frames: frameCount)
+        let original = abl.samples
+        for _ in 0..<12 {
+            abl.resetFrontSine(sampleRate: format.sampleRate)
+            host.renderFrontStereo(
+                buffers: abl.bufferList,
+                frameCount: frameCount,
+                channelIndices: indices
+            )
+        }
+        let output = abl.samples
+        let frontChanged = (0..<frameCount).contains { frame in
+            output[frame * channelCount] != original[frame * channelCount] ||
+                output[frame * channelCount + 1] != original[frame * channelCount + 1]
+        }
+        #expect(frontChanged)
+        for channel in 2..<channelCount {
+            for frame in 0..<frameCount {
+                #expect(output[frame * channelCount + channel] == original[frame * channelCount + channel])
+            }
+        }
+    }
+
+    private func lowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+}
+
+private final class FrontStereoTestABL {
+    nonisolated(unsafe) let pointer: UnsafeMutablePointer<AudioBufferList>
+    nonisolated(unsafe) private let data: UnsafeMutablePointer<Float>
+    let channels: Int
+    let frames: Int
+
+    init(channels: Int, frames: Int) {
+        self.channels = channels
+        self.frames = frames
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: MemoryLayout<AudioBufferList>.size,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        pointer = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+        data = .allocate(capacity: channels * frames)
+        data.initialize(repeating: 0, count: channels * frames)
+        pointer.pointee.mNumberBuffers = 1
+        UnsafeMutableAudioBufferListPointer(pointer)[0] = AudioBuffer(
+            mNumberChannels: UInt32(channels),
+            mDataByteSize: UInt32(channels * frames * MemoryLayout<Float>.size),
+            mData: UnsafeMutableRawPointer(data)
+        )
+        resetFrontSine(sampleRate: 44_100)
+    }
+
+    var bufferList: UnsafeMutableAudioBufferListPointer { UnsafeMutableAudioBufferListPointer(pointer) }
+    var samples: [Float] { Array(UnsafeBufferPointer(start: data, count: channels * frames)) }
+
+    func resetFrontSine(sampleRate: Double) {
+        for frame in 0..<frames {
+            let sample = sinf(2 * .pi * 15_000 * Float(frame) / Float(sampleRate))
+            for channel in 0..<channels {
+                data[frame * channels + channel] = channel < 2 ? sample : Float(channel + 1)
+            }
+        }
+    }
+
+    deinit {
+        data.deallocate()
+        pointer.deallocate()
     }
 }
 
