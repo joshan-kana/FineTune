@@ -438,9 +438,15 @@ struct FrontStereoRoutingTests {
             )
         }
         let output = abl.samples
-        let frontChanged = (0..<frameCount).contains { frame in
-            output[frame * channelCount] != original[frame * channelCount] ||
-                output[frame * channelCount + 1] != original[frame * channelCount + 1]
+        var frontChanged = false
+        for frame in 0..<frameCount {
+            let base = frame * channelCount
+            let leftChanged = output[base] != original[base]
+            let rightChanged = output[base + 1] != original[base + 1]
+            if leftChanged || rightChanged {
+                frontChanged = true
+                break
+            }
         }
         #expect(frontChanged)
         for channel in 2..<channelCount {
