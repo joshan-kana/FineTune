@@ -1080,6 +1080,14 @@ final class AudioEngine {
         commitAppAU(state, for: app)
     }
 
+    func updateAUProcessingMode(for app: AudioApp, entry: AUEffectChainEntry) {
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
+        guard let index = state.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        state.entries[index].processingMode = entry.processingMode
+        state.entries[index].selectedStereoPair = entry.selectedStereoPair
+        commitAppAU(state, for: app)
+    }
+
     func setAUChainBypassed(for app: AudioApp, bypassed: Bool) {
         taps[app.id]?.setAUChainBypassed(bypassed)
         appAU[app.persistenceIdentifier, default: AUChainState()].isBypassed = bypassed
@@ -1129,6 +1137,11 @@ final class AudioEngine {
     func getAUProcessingTopologyDescriptions(for app: AudioApp) -> [UUID: String] {
         guard let tap = taps[app.id] as? ProcessTapController else { return [:] }
         return tap.auEffectChainTopologyDescriptions
+    }
+
+    func getAUAvailableStereoPairs(for app: AudioApp) -> [AUStereoPair] {
+        guard let tap = taps[app.id] as? ProcessTapController else { return [] }
+        return tap.auAvailableStereoPairs
     }
 
     private func commitAppAU(_ state: AUChainState, for app: AudioApp, onCommitted: @escaping @MainActor @Sendable () -> Void = {}) {
@@ -1221,6 +1234,14 @@ final class AudioEngine {
         commitDeviceAU(state, for: deviceUID)
     }
 
+    func updateDeviceAUProcessingMode(deviceUID: String, entry: AUEffectChainEntry) {
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
+        guard let index = state.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        state.entries[index].processingMode = entry.processingMode
+        state.entries[index].selectedStereoPair = entry.selectedStereoPair
+        commitDeviceAU(state, for: deviceUID)
+    }
+
     func openDeviceAUPluginUI(deviceUID: String, entryID: UUID, forceGeneric: Bool = false) {
         for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
             if let tap = tap as? ProcessTapController,
@@ -1264,6 +1285,15 @@ final class AudioEngine {
             }
         }
         return [:]
+    }
+
+    func getDeviceAUAvailableStereoPairs(deviceUID: String) -> [AUStereoPair] {
+        for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
+            if let tap = tap as? ProcessTapController {
+                return tap.deviceAUAvailableStereoPairs
+            }
+        }
+        return []
     }
 
     func setDeviceAUChainBypassed(deviceUID: String, bypassed: Bool) {

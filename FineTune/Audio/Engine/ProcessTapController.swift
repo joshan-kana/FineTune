@@ -435,8 +435,9 @@ final class ProcessTapController: ProcessTapControlling {
         guard let chain = auEffectChain else { return [:] }
         return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
     }
+    var auAvailableStereoPairs: [AUStereoPair] { currentAUFormat().availableStereoPairs }
     func auEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(auEffectChain) }
-    func getAUHost(for entryID: UUID) -> AUEffectHost? { auEffectChain?.host(for: entryID) }
+    func getAUHost(for entryID: UUID) -> AUEffectHost? { auEffectChain?.editorHost(for: entryID) }
 
     func setAUChainBypassed(_ bypassed: Bool) {
         auEffectChain?.setBypassed(bypassed)
@@ -586,7 +587,6 @@ final class ProcessTapController: ProcessTapControlling {
         guard let token = token as? ProcessTapPreparedDeviceAUChain,
               preparedDeviceAUChains[token.tokenID] === token,
               token.lifecycle == .commitClaimed else { return }
-        closeReplacedPluginWindows(oldChain: token.oldChain, replacementEntries: token.currentEntries)
         publishAUChainPair(
             token.replacement,
             secondary: token.secondaryReplacement,
@@ -595,6 +595,7 @@ final class ProcessTapController: ProcessTapControlling {
             bypassed: token.bypassed,
             entries: token.currentEntries
         )
+        rebindReplacedPluginWindows(oldChain: token.oldChain, replacement: token.replacement, replacementEntries: token.currentEntries)
         updateMaxTailTime()
         _ = token.finishCommit()
         preparedDeviceAUChains.removeValue(forKey: token.tokenID)
@@ -619,8 +620,9 @@ final class ProcessTapController: ProcessTapControlling {
         guard let chain = deviceAUEffectChain else { return [:] }
         return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
     }
+    var deviceAUAvailableStereoPairs: [AUStereoPair] { currentAUFormat().availableStereoPairs }
     func deviceAUEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(deviceAUEffectChain) }
-    func getDeviceAUHost(for entryID: UUID) -> AUEffectHost? { deviceAUEffectChain?.host(for: entryID) }
+    func getDeviceAUHost(for entryID: UUID) -> AUEffectHost? { deviceAUEffectChain?.editorHost(for: entryID) }
 
     func setDeviceAUChainBypassed(_ bypassed: Bool) {
         deviceAUEffectChain?.setBypassed(bypassed)
@@ -669,15 +671,24 @@ final class ProcessTapController: ProcessTapControlling {
         return prepared
     }
 
-    private func closeReplacedPluginWindows(
+    private func rebindReplacedPluginWindows(
         oldChain: AUEffectChain?,
+        replacement: AUEffectChain?,
         replacementEntries: [AUEffectChainEntry]
     ) {
         guard let oldChain else { return }
         for oldEntry in oldChain.entries {
             guard let replacementEntry = replacementEntries.first(where: { $0.id == oldEntry.id }),
                   oldChain.canReuseHost(for: replacementEntry) else {
-                AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
+                if let host = replacement?.editorHost(for: oldEntry.id), let au = host.audioUnit {
+                    AUPluginWindowManager.shared.rebindWindow(
+                        for: oldEntry.id,
+                        audioUnit: au,
+                        pluginName: host.descriptor.name
+                    )
+                } else {
+                    AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
+                }
                 continue
             }
         }
@@ -728,7 +739,6 @@ final class ProcessTapController: ProcessTapControlling {
                     completion(.rejected(reason: .timedOut))
                     return
                 }
-                self.closeReplacedPluginWindows(oldChain: old, replacementEntries: entries)
                 self.publishAUChainPair(
                     replacement,
                     secondary: secondaryReplacement,
@@ -737,6 +747,7 @@ final class ProcessTapController: ProcessTapControlling {
                     bypassed: bypassed,
                     entries: entries
                 )
+                self.rebindReplacedPluginWindows(oldChain: old, replacement: replacement, replacementEntries: entries)
                 self.updateMaxTailTime()
                 completion(.committed)
             }
@@ -754,12 +765,20 @@ final class ProcessTapController: ProcessTapControlling {
         chain?.setBypassed(bypassed)
         secondary?.setBypassed(bypassed)
         if device {
+            deviceAUEffectChain?.deactivatePeerObservers()
+            secondaryDeviceAUEffectChain?.deactivatePeerObservers()
             deviceAUEffectChain = chain
             if publishSecondary { secondaryDeviceAUEffectChain = secondary }
+            chain?.activatePeerObservers()
+            if publishSecondary { secondary?.activatePeerObservers() }
             _currentDeviceAUEntries = entries
         } else {
+            auEffectChain?.deactivatePeerObservers()
+            secondaryAUEffectChain?.deactivatePeerObservers()
             auEffectChain = chain
             if publishSecondary { secondaryAUEffectChain = secondary }
+            chain?.activatePeerObservers()
+            if publishSecondary { secondary?.activatePeerObservers() }
             _currentAUEntries = entries
         }
     }

@@ -61,8 +61,10 @@ struct DeviceRow: View {
     let onOpenDeviceAUGenericUI: ((UUID) -> Void)?
     let deviceAUFailedEntryIDs: Set<UUID>
     let deviceAUTopologyDescriptions: [UUID: String]
+    let deviceAUAvailableStereoPairs: [AUStereoPair]
     let getDeviceAUFactoryPresets: ((UUID) -> [(index: Int, name: String)])?
     let onSelectDeviceAUFactoryPreset: ((UUID, Int) -> Void)?
+    let onUpdateDeviceAUEntry: ((AUEffectChainEntry) -> Void)?
 
     @State private var sliderValue: Double
     @State private var isEditing = false
@@ -131,8 +133,10 @@ struct DeviceRow: View {
         onOpenDeviceAUGenericUI: ((UUID) -> Void)? = nil,
         deviceAUFailedEntryIDs: Set<UUID> = [],
         deviceAUTopologyDescriptions: [UUID: String] = [:],
+        deviceAUAvailableStereoPairs: [AUStereoPair] = [],
         getDeviceAUFactoryPresets: ((UUID) -> [(index: Int, name: String)])? = nil,
-        onSelectDeviceAUFactoryPreset: ((UUID, Int) -> Void)? = nil
+        onSelectDeviceAUFactoryPreset: ((UUID, Int) -> Void)? = nil,
+        onUpdateDeviceAUEntry: ((AUEffectChainEntry) -> Void)? = nil
     ) {
         self.device = device
         self.isDefault = isDefault
@@ -172,8 +176,10 @@ struct DeviceRow: View {
         self.onOpenDeviceAUGenericUI = onOpenDeviceAUGenericUI
         self.deviceAUFailedEntryIDs = deviceAUFailedEntryIDs
         self.deviceAUTopologyDescriptions = deviceAUTopologyDescriptions
+        self.deviceAUAvailableStereoPairs = deviceAUAvailableStereoPairs
         self.getDeviceAUFactoryPresets = getDeviceAUFactoryPresets
         self.onSelectDeviceAUFactoryPreset = onSelectDeviceAUFactoryPreset
+        self.onUpdateDeviceAUEntry = onUpdateDeviceAUEntry
         self._sliderValue = State(initialValue: Self.volumeToSlider(volume, backend: volumeBackend))
     }
 
@@ -196,6 +202,8 @@ struct DeviceRow: View {
                     onOpenGenericUI: { id in onOpenDeviceAUGenericUI?(id) },
                     failedEntryIDs: deviceAUFailedEntryIDs,
                     topologyDescriptions: deviceAUTopologyDescriptions,
+                    availableStereoPairs: deviceAUAvailableStereoPairs,
+                    onUpdateEntry: onUpdateDeviceAUEntry,
                     getFactoryPresets: getDeviceAUFactoryPresets,
                     onSelectFactoryPreset: onSelectDeviceAUFactoryPreset
                 )

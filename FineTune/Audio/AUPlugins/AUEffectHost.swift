@@ -20,6 +20,10 @@ private func auPeerEventListener(
 enum AUProcessingTopology: Equatable {
     case native
     case independentPerChannel
+    case singleStereoPair(AUStereoPair)
+    case linkedStereoPairs([AUStereoPair])
+    /// Kept for source compatibility with the initial Phase A tests and
+    /// callers. New active chains use `singleStereoPair(.front)`.
     case frontStereoPassThrough
     case unsupported
 
@@ -28,11 +32,27 @@ enum AUProcessingTopology: Equatable {
         channelCount: Int,
         nativeCanProcess: Bool,
         supportedChannelCounts: [(input: Int, output: Int)],
-        hasFrontStereoPair: Bool = true
+        hasFrontStereoPair: Bool = true,
+        requestedPair: AUStereoPair = .front,
+        availableStereoPairs: Set<AUStereoPair>? = nil
     ) -> Self {
         if mode == .bypassForLayout { return .unsupported }
         if mode == .stereoOnly { return channelCount == 2 && nativeCanProcess ? .native : .unsupported }
         if mode == .nativeMultichannel { return nativeCanProcess ? .native : .unsupported }
+        if mode == .singleStereoPair {
+            let pairAvailable = availableStereoPairs?.contains(requestedPair) ?? (requestedPair == .front && hasFrontStereoPair)
+            return channelCount > 2 && pairAvailable && supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts)
+                ? .singleStereoPair(requestedPair) : .unsupported
+        }
+        if mode == .linkedStereoPairs {
+            guard channelCount > 2,
+                  let pairs = availableStereoPairs,
+                  !pairs.isEmpty,
+                  supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts) else {
+                return .unsupported
+            }
+            return .linkedStereoPairs(AUStereoPair.allCases.filter { pairs.contains($0) })
+        }
         if mode == .independentPerChannel {
             return channelCount > 1 && supports(
                 input: 1,
@@ -42,12 +62,12 @@ enum AUProcessingTopology: Equatable {
         }
         if nativeCanProcess { return .native }
         guard channelCount > 2 else { return .unsupported }
-        if supports(input: 1, output: 1, supportedChannelCounts: supportedChannelCounts) {
-            return .independentPerChannel
-        }
         if hasFrontStereoPair,
            supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts) {
-            return .frontStereoPassThrough
+            return .singleStereoPair(.front)
+        }
+        if supports(input: 1, output: 1, supportedChannelCounts: supportedChannelCounts) {
+            return .independentPerChannel
         }
         return .unsupported
     }
@@ -137,6 +157,8 @@ final class AUEffectHost: @unchecked Sendable {
         case .nativeMultichannel: return "Native \(format.shortLabel)"
         case .independentPerChannel: return "Independent ×\(format.channelCount)"
         case .stereoOnly: return "Stereo only"
+        case .singleStereoPair: return "Stereo pair"
+        case .linkedStereoPairs: return "Linked stereo pairs"
         case .bypassForLayout: return "Bypass for this layout"
         case .auto: return format.channelCount > 2 ? "Native \(format.shortLabel)" : "Native stereo"
         }
@@ -448,6 +470,18 @@ final class AUEffectHost: @unchecked Sendable {
     /// written back, so they remain byte-for-byte unchanged on success.
     @inline(__always)
     func renderFrontStereo(
+        buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int,
+        channelIndices: (left: Int, right: Int)
+    ) {
+        renderStereoPair(buffers: buffers, frameCount: frameCount, channelIndices: channelIndices)
+    }
+
+    /// Processes exactly one semantic stereo pair. The host itself is always
+    /// negotiated as stereo, while the destination buffer can be any larger
+    /// interleaved or non-interleaved stream.
+    @inline(__always)
+    func renderStereoPair(
         buffers: UnsafeMutableAudioBufferListPointer,
         frameCount: Int,
         channelIndices: (left: Int, right: Int)

@@ -50,8 +50,10 @@ struct AppRowWithLevelPolling: View {
     let onOpenAUGenericUI: (UUID) -> Void
     let auFailedEntryIDs: Set<UUID>
     let auTopologyDescriptions: [UUID: String]
+    let auAvailableStereoPairs: [AUStereoPair]
     let getAUFactoryPresets: (UUID) -> [(index: Int, name: String)]
     let onSelectAUFactoryPreset: (UUID, Int) -> Void
+    let onUpdateAUEntry: (AUEffectChainEntry) -> Void
 
     @State private var displayLevel: Float = 0
     @State private var levelTimer: Timer?
@@ -102,8 +104,10 @@ struct AppRowWithLevelPolling: View {
         onOpenAUGenericUI: @escaping (UUID) -> Void = { _ in },
         auFailedEntryIDs: Set<UUID> = [],
         auTopologyDescriptions: [UUID: String] = [:],
+        auAvailableStereoPairs: [AUStereoPair] = [],
         getAUFactoryPresets: @escaping (UUID) -> [(index: Int, name: String)] = { _ in [] },
-        onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in }
+        onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in },
+        onUpdateAUEntry: @escaping (AUEffectChainEntry) -> Void = { _ in }
     ) {
         self.app = app
         self.volume = volume
@@ -150,8 +154,10 @@ struct AppRowWithLevelPolling: View {
         self.onOpenAUGenericUI = onOpenAUGenericUI
         self.auFailedEntryIDs = auFailedEntryIDs
         self.auTopologyDescriptions = auTopologyDescriptions
+        self.auAvailableStereoPairs = auAvailableStereoPairs
         self.getAUFactoryPresets = getAUFactoryPresets
         self.onSelectAUFactoryPreset = onSelectAUFactoryPreset
+        self.onUpdateAUEntry = onUpdateAUEntry
     }
 
     var body: some View {
@@ -200,8 +206,10 @@ struct AppRowWithLevelPolling: View {
             onOpenAUGenericUI: onOpenAUGenericUI,
             auFailedEntryIDs: auFailedEntryIDs,
             auTopologyDescriptions: auTopologyDescriptions,
+            auAvailableStereoPairs: auAvailableStereoPairs,
             getAUFactoryPresets: getAUFactoryPresets,
-            onSelectAUFactoryPreset: onSelectAUFactoryPreset
+            onSelectAUFactoryPreset: onSelectAUFactoryPreset,
+            onUpdateAUEntry: onUpdateAUEntry
         )
         .onAppear {
             if isPopupVisible {

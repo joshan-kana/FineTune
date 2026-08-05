@@ -16,6 +16,8 @@ struct AUEffectChainView: View {
     var onOpenGenericUI: ((UUID) -> Void)? = nil
     var failedEntryIDs: Set<UUID> = []
     var topologyDescriptions: [UUID: String] = [:]
+    var availableStereoPairs: [AUStereoPair] = []
+    var onUpdateEntry: ((AUEffectChainEntry) -> Void)? = nil
     var getFactoryPresets: ((UUID) -> [(index: Int, name: String)])? = nil
     var onSelectFactoryPreset: ((UUID, Int) -> Void)? = nil
 
@@ -106,6 +108,57 @@ struct AUEffectChainView: View {
 
             Spacer()
 
+            if let onUpdateEntry {
+                Menu {
+                    ForEach(AUProcessingMode.userSelectableModes, id: \.self) { mode in
+                        Button {
+                            var updated = entry
+                            updated.processingMode = mode
+                            if mode == .singleStereoPair, updated.selectedStereoPair == nil {
+                                updated.selectedStereoPair = .front
+                            }
+                            onUpdateEntry(updated)
+                        } label: {
+                            if entry.processingMode == mode {
+                                Label(mode.displayLabel, systemImage: "checkmark")
+                            } else {
+                                Text(mode.displayLabel)
+                            }
+                        }
+                    }
+                } label: {
+                    Text(entry.processingMode.displayLabel)
+                        .font(.system(size: 8))
+                        .foregroundStyle(DesignTokens.Colors.textSecondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+
+                if entry.processingMode == .singleStereoPair {
+                    Menu {
+                        ForEach(availableStereoPairs, id: \.self) { pair in
+                            Button {
+                                var updated = entry
+                                updated.selectedStereoPair = pair
+                                onUpdateEntry(updated)
+                            } label: {
+                                if (entry.selectedStereoPair ?? .front) == pair {
+                                    Label(pair.label, systemImage: "checkmark")
+                                } else {
+                                    Text(pair.label)
+                                }
+                            }
+                        }
+                    } label: {
+                        Text((entry.selectedStereoPair ?? .front).label)
+                            .font(.system(size: 8))
+                            .foregroundStyle(DesignTokens.Colors.textSecondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                }
+            }
+
             // Factory preset picker
             if let getPresets = getFactoryPresets,
                let onSelect = onSelectFactoryPreset {
@@ -178,6 +231,8 @@ struct AUEffectChainView: View {
         case .auto: return "Auto • native layout preferred"
         case .nativeMultichannel: return "Native multichannel • layout required"
         case .independentPerChannel: return "Independent per-channel"
+        case .singleStereoPair: return "Single stereo pair"
+        case .linkedStereoPairs: return "Linked stereo pairs"
         case .stereoOnly: return "Stereo only • bypasses other layouts"
         case .bypassForLayout: return "Bypass for current layout"
         }

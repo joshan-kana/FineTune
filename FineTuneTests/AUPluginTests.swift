@@ -201,6 +201,8 @@ struct AUEffectChainEntryTests {
         entry.isEnabled = false
         entry.presetData = Data([0x01, 0x02, 0x03])
         entry.selectedFactoryPresetIndex = 5
+        entry.processingMode = .singleStereoPair
+        entry.selectedStereoPair = .rear
 
         let data = try JSONEncoder().encode(entry)
         let decoded = try JSONDecoder().decode(AUEffectChainEntry.self, from: data)
@@ -209,6 +211,19 @@ struct AUEffectChainEntryTests {
         #expect(decoded.isEnabled == false)
         #expect(decoded.presetData == Data([0x01, 0x02, 0x03]))
         #expect(decoded.selectedFactoryPresetIndex == 5)
+        #expect(decoded.processingMode == .singleStereoPair)
+        #expect(decoded.selectedStereoPair == .rear)
+    }
+
+    @Test("Old entries decode with Auto and no pair target")
+    func decodesLegacyEntry() throws {
+        let entry = AUEffectChainEntry(plugin: makePlugin())
+        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+        object.removeValue(forKey: "selectedStereoPair")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(AUEffectChainEntry.self, from: data)
+        #expect(decoded.processingMode == .auto)
+        #expect(decoded.selectedStereoPair == nil)
     }
 
     @Test("Equatable compares by ID")
@@ -353,7 +368,7 @@ struct AUProcessingTopologyTests {
                 channelCount: 8,
                 nativeCanProcess: false,
                 supportedChannelCounts: mockCapabilities
-            ) == .independentPerChannel
+            ) == .singleStereoPair(.front)
         )
     }
 
@@ -366,7 +381,7 @@ struct AUProcessingTopologyTests {
                 channelCount: 8,
                 nativeCanProcess: false,
                 supportedChannelCounts: mockCapabilities
-            ) == .frontStereoPassThrough
+            ) == .singleStereoPair(.front)
         )
         #expect(
             AUProcessingTopology.choose(
@@ -385,6 +400,52 @@ struct AUProcessingTopologyTests {
         #expect(AUProcessingTopology.choose(mode: .nativeMultichannel, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
         #expect(AUProcessingTopology.choose(mode: .stereoOnly, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
         #expect(AUProcessingTopology.choose(mode: .bypassForLayout, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(
+            mode: .singleStereoPair,
+            channelCount: 6,
+            nativeCanProcess: false,
+            supportedChannelCounts: stereoOnly,
+            requestedPair: .rear,
+            availableStereoPairs: [.front, .side]
+        ) == .unsupported)
+        #expect(AUProcessingTopology.choose(
+            mode: .linkedStereoPairs,
+            channelCount: 8,
+            nativeCanProcess: false,
+            supportedChannelCounts: stereoOnly,
+            availableStereoPairs: [.front, .side, .rear]
+        ) == .linkedStereoPairs([.front, .side, .rear]))
+    }
+}
+
+@Suite("Semantic multichannel topology")
+struct SemanticMultichannelTopologyTests {
+    @Test("7.1 resolves front, side, and rear without pairing centre or LFE")
+    func sevenOnePairs() {
+        let format = AudioStreamFormatDescription(sampleRate: 48_000, channelCount: 8, isInterleaved: true)
+        #expect(format.availableStereoPairs == [.front, .side, .rear])
+        #expect(format.stereoPairChannelIndices(for: .front)?.left == 0)
+        #expect(format.stereoPairChannelIndices(for: .side)?.left == 4)
+        #expect(format.stereoPairChannelIndices(for: .rear)?.left == 6)
+    }
+
+    @Test("5.1 exposes the surround pair as side and has no rear guess")
+    func fiveOnePairs() {
+        let format = AudioStreamFormatDescription(sampleRate: 48_000, channelCount: 6, isInterleaved: false)
+        #expect(format.availableStereoPairs == [.front, .side])
+        #expect(format.stereoPairChannelIndices(for: .rear) == nil)
+    }
+
+    @Test("Unknown layouts do not guess odd/even pairs")
+    func unknownLayoutDoesNotGuess() {
+        let format = AudioStreamFormatDescription(
+            sampleRate: 48_000,
+            channelCount: 4,
+            isInterleaved: true,
+            channelLayoutTag: 0,
+            channelRoles: [.unknown, .unknown, .unknown, .unknown]
+        )
+        #expect(format.availableStereoPairs.isEmpty)
     }
 }
 
