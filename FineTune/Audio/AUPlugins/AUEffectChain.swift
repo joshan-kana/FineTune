@@ -176,17 +176,20 @@ final class AUEffectChain: @unchecked Sendable {
                 format: self.format,
                 processingMode: entry.processingMode
             )
-            guard native.instantiate() else {
-                failed.insert(entry.id)
-                groups.append([])
-                enabledGroups.append(false)
-                continue
-            }
+            // A third-party AU may reject the native HDMI layout during
+            // stream-format negotiation or initialization while still
+            // supporting a safe mono fallback. Keep the capability metadata
+            // gathered before that rejection and try the fallback before
+            // declaring the entry failed.
+            let nativeInstantiated = native.instantiate()
+            let topology = AUProcessingTopology.choose(
+                mode: entry.processingMode,
+                channelCount: self.format.channelCount,
+                nativeCanProcess: nativeInstantiated && native.canProcessCurrentLayout,
+                supportedChannelCounts: native.supportedChannelCounts
+            )
 
-            let wantsIndependent = entry.processingMode == .independentPerChannel ||
-                (entry.processingMode == .auto && self.format.channelCount > 2 && !native.canProcessCurrentLayout)
-
-            if wantsIndependent && self.format.channelCount > 1 {
+            if topology == .independentPerChannel && self.format.channelCount > 1 {
                 let monoFormat = AudioStreamFormatDescription(
                     sampleRate: self.format.sampleRate,
                     frameCapacity: self.format.frameCapacity,
@@ -209,12 +212,17 @@ final class AUEffectChain: @unchecked Sendable {
                         monos.removeAll()
                         break
                     }
-                    if let preset = entry.presetData { _ = mono.loadPreset(preset) }
-                    else if let index = entry.selectedFactoryPresetIndex { _ = mono.selectFactoryPreset(index: index) }
+                    if let preset = entry.presetData {
+                        _ = mono.loadPreset(preset)
+                    } else if let index = entry.selectedFactoryPresetIndex {
+                        _ = mono.selectFactoryPreset(index: index)
+                    }
                     monos.append(mono)
                 }
                 if monos.count == self.format.channelCount {
-                    native.setEnabled(false)
+                    if nativeInstantiated {
+                        native.setEnabled(false)
+                    }
                     groups.append(monos)
                     enabledGroups.append(entry.isEnabled)
                     allHosts.append(contentsOf: monos)
@@ -222,17 +230,28 @@ final class AUEffectChain: @unchecked Sendable {
                 }
             }
 
-            if !native.canProcessCurrentLayout {
+            if !nativeInstantiated || topology == .unsupported || !native.canProcessCurrentLayout {
                 unsupported.insert(entry.id)
             }
-            if let preset = entry.presetData { _ = native.loadPreset(preset) }
-            else if let index = entry.selectedFactoryPresetIndex { _ = native.selectFactoryPreset(index: index) }
-            groups.append([native])
-            enabledGroups.append(entry.isEnabled)
-            allHosts.append(native)
+            if nativeInstantiated {
+                if let preset = entry.presetData {
+                    _ = native.loadPreset(preset)
+                } else if let index = entry.selectedFactoryPresetIndex {
+                    _ = native.selectFactoryPreset(index: index)
+                }
+                groups.append([native])
+                enabledGroups.append(entry.isEnabled)
+                allHosts.append(native)
+            } else {
+                failed.insert(entry.id)
+                groups.append([])
+                enabledGroups.append(false)
+            }
         }
 
-        self.failedEntryIDs = failed
+        // Unsupported layouts are a visible failure too: their hosts remain
+        // fail-open, but the UI must not imply that the AU is processing.
+        self.failedEntryIDs = failed.union(unsupported)
         self.unsupportedEntryIDs = unsupported
         self._hosts = allHosts
         self.hostGroups = groups

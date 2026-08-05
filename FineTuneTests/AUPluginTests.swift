@@ -340,6 +340,37 @@ struct AUChannelCapabilityMatcherTests {
     }
 }
 
+@Suite("AU processing topology")
+struct AUProcessingTopologyTests {
+    @Test("A mock stereo-capable AU can fall back after native initialization rejects HDMI")
+    func retriesSupportedFallbackAfterNativeFailure() {
+        // This models FabFilter Pro-C 2 and BABY Audio Comeback: their mock
+        // capability table accepts mono/stereo but rejects an 8-channel bus.
+        let mockCapabilities = [(input: 1, output: 1), (input: 2, output: 2)]
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 8,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities
+            ) == .independentPerChannel
+        )
+    }
+
+    @Test("A mock stereo-only AU stays visibly unsupported when mono is unavailable")
+    func rejectsUnsupportedFallback() {
+        let mockCapabilities = [(input: 2, output: 2)]
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 8,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities
+            ) == .unsupported
+        )
+    }
+}
+
 @Suite("Audio Unit chain topology")
 struct AUEffectChainTopologyTests {
     @Test("Parallel hosts use maximum and serial entries use sum")

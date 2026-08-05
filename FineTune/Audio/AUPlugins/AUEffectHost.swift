@@ -14,6 +14,54 @@ private func auPeerEventListener(
     host.notifyParameterChange(event.pointee.mArgument.mParameter, value: value)
 }
 
+/// Chooses a safe topology after an Audio Unit rejects the device's native
+/// layout. The capability list is injected by the host during preparation and
+/// can be replaced with a mock in tests without loading a product AU.
+enum AUProcessingTopology: Equatable {
+    case native
+    case independentPerChannel
+    case unsupported
+
+    static func choose(
+        mode: AUProcessingMode,
+        channelCount: Int,
+        nativeCanProcess: Bool,
+        supportedChannelCounts: [(input: Int, output: Int)]
+    ) -> Self {
+        if mode == .bypassForLayout { return .unsupported }
+        if mode == .stereoOnly { return channelCount == 2 && nativeCanProcess ? .native : .unsupported }
+        if mode == .nativeMultichannel { return nativeCanProcess ? .native : .unsupported }
+        if mode == .independentPerChannel {
+            return channelCount > 1 && supports(
+                input: 1,
+                output: 1,
+                supportedChannelCounts: supportedChannelCounts
+            ) ? .independentPerChannel : (nativeCanProcess ? .native : .unsupported)
+        }
+        if nativeCanProcess { return .native }
+        guard channelCount > 2 else { return .unsupported }
+        return supports(input: 1, output: 1, supportedChannelCounts: supportedChannelCounts)
+            ? .independentPerChannel
+            : .unsupported
+    }
+
+    private static func supports(
+        input: Int,
+        output: Int,
+        supportedChannelCounts: [(input: Int, output: Int)]
+    ) -> Bool {
+        guard !supportedChannelCounts.isEmpty else { return input <= 2 && output <= 2 }
+        return supportedChannelCounts.contains {
+            AUChannelCapabilityMatcher.matches(
+                input: $0.input,
+                output: $0.output,
+                requestedInput: input,
+                requestedOutput: output
+            )
+        }
+    }
+}
+
 /// Real-time-safe host for one Audio Unit instance.
 ///
 /// Audio Units are prepared, negotiated, and initialized before the render
@@ -29,6 +77,7 @@ final class AUEffectHost: @unchecked Sendable {
     private nonisolated(unsafe) var _audioUnit: AudioUnit?
     private nonisolated(unsafe) var _isEnabled: Bool
     private nonisolated(unsafe) var _sampleTime: Float64 = 0
+    private nonisolated(unsafe) var _lastRenderStatus: OSStatus = noErr
     private var parameterListener: AUEventListenerRef?
     private var parameterChangeHandler: ((AudioUnitParameter, AudioUnitParameterValue) -> Void)?
     private var observedParameters: [AudioUnitParameter] = []
@@ -55,6 +104,8 @@ final class AUEffectHost: @unchecked Sendable {
 
     var isEnabled: Bool { _isEnabled }
     var audioUnit: AudioUnit? { _audioUnit }
+    var lastRenderStatus: OSStatus { _lastRenderStatus }
+    var hasRenderFailed: Bool { _lastRenderStatus != noErr }
 
     #if DEBUG
     private var peerParameterSetterForTesting: ((AudioUnitParameterValue) -> OSStatus)?
@@ -346,7 +397,12 @@ final class AUEffectHost: @unchecked Sendable {
         timestamp.mFlags = .sampleTimeValid
         timestamp.mSampleTime = _sampleTime
         _sampleTime += Float64(count)
-        guard let au = _audioUnit, AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL) == noErr else { return }
+        guard let au = _audioUnit else { return }
+        let renderStatus = AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL)
+        guard renderStatus == noErr else {
+            if _lastRenderStatus == noErr { _lastRenderStatus = renderStatus }
+            return
+        }
 
         copyFromPlanar(buffers, frameCount: count)
     }
@@ -371,7 +427,12 @@ final class AUEffectHost: @unchecked Sendable {
         timestamp.mFlags = .sampleTimeValid
         timestamp.mSampleTime = _sampleTime
         _sampleTime += Float64(count)
-        guard let au = _audioUnit, AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL) == noErr else { return }
+        guard let au = _audioUnit else { return }
+        let renderStatus = AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL)
+        guard renderStatus == noErr else {
+            if _lastRenderStatus == noErr { _lastRenderStatus = renderStatus }
+            return
+        }
         for frame in 0..<count { samples[frame * safeStride] = output[frame] }
     }
 
