@@ -1080,6 +1080,14 @@ final class AudioEngine {
         commitAppAU(state, for: app)
     }
 
+    func updateAUProcessingMode(for app: AudioApp, entry: AUEffectChainEntry) {
+        var state = pendingAppAU[app.persistenceIdentifier]?.state ?? appAU[app.persistenceIdentifier] ?? AUChainState()
+        guard let index = state.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        state.entries[index].processingMode = entry.processingMode
+        state.entries[index].selectedStereoPair = entry.selectedStereoPair
+        commitAppAU(state, for: app)
+    }
+
     func setAUChainBypassed(for app: AudioApp, bypassed: Bool) {
         taps[app.id]?.setAUChainBypassed(bypassed)
         appAU[app.persistenceIdentifier, default: AUChainState()].isBypassed = bypassed
@@ -1124,6 +1132,16 @@ final class AudioEngine {
         guard let tap = taps[app.id] as? ProcessTapController,
               let host = tap.getAUHost(for: entryID) else { return [] }
         return host.factoryPresets
+    }
+
+    func getAUProcessingTopologyDescriptions(for app: AudioApp) -> [UUID: String] {
+        guard let tap = taps[app.id] as? ProcessTapController else { return [:] }
+        return tap.auEffectChainTopologyDescriptions
+    }
+
+    func getAUAvailableStereoPairs(for app: AudioApp) -> [AUStereoPair] {
+        guard let tap = taps[app.id] as? ProcessTapController else { return [] }
+        return tap.auAvailableStereoPairs
     }
 
     private func commitAppAU(_ state: AUChainState, for app: AudioApp, onCommitted: @escaping @MainActor @Sendable () -> Void = {}) {
@@ -1216,6 +1234,14 @@ final class AudioEngine {
         commitDeviceAU(state, for: deviceUID)
     }
 
+    func updateDeviceAUProcessingMode(deviceUID: String, entry: AUEffectChainEntry) {
+        var state = pendingDeviceAU[deviceUID]?.state ?? deviceAU[deviceUID] ?? AUChainState()
+        guard let index = state.entries.firstIndex(where: { $0.id == entry.id }) else { return }
+        state.entries[index].processingMode = entry.processingMode
+        state.entries[index].selectedStereoPair = entry.selectedStereoPair
+        commitDeviceAU(state, for: deviceUID)
+    }
+
     func openDeviceAUPluginUI(deviceUID: String, entryID: UUID, forceGeneric: Bool = false) {
         for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
             if let tap = tap as? ProcessTapController,
@@ -1247,6 +1273,24 @@ final class AudioEngine {
             if let tap = tap as? ProcessTapController,
                let host = tap.getDeviceAUHost(for: entryID) {
                 return host.factoryPresets
+            }
+        }
+        return []
+    }
+
+    func getDeviceAUProcessingTopologyDescriptions(deviceUID: String) -> [UUID: String] {
+        for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
+            if let tap = tap as? ProcessTapController {
+                return tap.deviceAUEffectChainTopologyDescriptions
+            }
+        }
+        return [:]
+    }
+
+    func getDeviceAUAvailableStereoPairs(deviceUID: String) -> [AUStereoPair] {
+        for (_, tap) in taps where tap.currentDeviceUIDs.contains(deviceUID) {
+            if let tap = tap as? ProcessTapController {
+                return tap.deviceAUAvailableStereoPairs
             }
         }
         return []
@@ -1416,13 +1460,18 @@ final class AudioEngine {
     private func tapInitialState(forApp app: AudioApp, primaryDeviceUID: String, deviceVolume: Float) -> TapInitialState {
         var loudnessEqSettings = LoudnessEqualizerSettings()
         loudnessEqSettings.enabled = settingsManager.appSettings.loudnessEqualizationEnabled
+        let appIdentifier = app.persistenceIdentifier
         return TapInitialState(
-            eqSettings: settingsManager.getEQSettings(for: app.persistenceIdentifier),
+            eqSettings: settingsManager.getEQSettings(for: appIdentifier),
             autoEQProfile: autoEQProfileForActivation(deviceUID: primaryDeviceUID),
             autoEQPreampEnabled: settingsManager.autoEQPreampEnabled,
             loudnessVolume: deviceVolume * volumeState.getVolume(for: app.id),
             loudnessCompensationEnabled: settingsManager.appSettings.loudnessCompensationEnabled,
-            loudnessEqualizerSettings: loudnessEqSettings
+            loudnessEqualizerSettings: loudnessEqSettings,
+            appAUEffectChain: settingsManager.getAUEffectChain(for: appIdentifier),
+            appAUBypassed: settingsManager.getAppAUBypassed(for: appIdentifier),
+            deviceAUEffectChain: settingsManager.getDeviceAUEffectChain(for: primaryDeviceUID),
+            deviceAUBypassed: settingsManager.getDeviceAUBypassed(for: primaryDeviceUID)
         )
     }
 
@@ -1689,12 +1738,25 @@ final class AudioEngine {
                 applyAutoEQToTap(tap)
             }
 
-            for deviceUID in deviceUIDs where !enrolledDeviceUIDs.contains(deviceUID) {
+            let appIdentifier = app.persistenceIdentifier
+            if !initial.appAUEffectChain.isEmpty || initial.appAUBypassed {
+                appAU[appIdentifier, default: AUChainState()].entries = initial.appAUEffectChain
+                appAU[appIdentifier, default: AUChainState()].isBypassed = initial.appAUBypassed
+                syncAppAUFailedIDs(for: app)
+            }
+            if !initial.deviceAUEffectChain.isEmpty || initial.deviceAUBypassed {
+                deviceAU[deviceUIDs[0], default: AUChainState()].entries = initial.deviceAUEffectChain
+                deviceAU[deviceUIDs[0], default: AUChainState()].isBypassed = initial.deviceAUBypassed
+                syncDeviceAUFailedIDs(for: deviceUIDs[0])
+            }
+
+            for deviceUID in deviceUIDs.dropFirst() where !enrolledDeviceUIDs.contains(deviceUID) {
                 let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
                 guard !savedDeviceAU.isEmpty else { continue }
                 tap.updateDeviceAUEffectChain(savedDeviceAU) { [weak self] result in
                     guard let self, case .committed = result else { return }
                     self.deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
+                    self.deviceAU[deviceUID, default: AUChainState()].isBypassed = self.settingsManager.getDeviceAUBypassed(for: deviceUID)
                     self.syncDeviceAUFailedIDs(for: deviceUID)
                 }
             }
@@ -1855,7 +1917,7 @@ final class AudioEngine {
             )
             try tap.activate(initial: initial)
             taps[app.id] = tap
-            let enrolledDeviceUIDs = enrollNewTapInPendingDeviceTransactions(tap, pid: app.id, deviceUIDs: [deviceUID])
+            _ = enrollNewTapInPendingDeviceTransactions(tap, pid: app.id, deviceUIDs: [deviceUID])
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
             // Imported profiles always hit the synchronous path above.
@@ -1863,25 +1925,20 @@ final class AudioEngine {
                 applyAutoEQToTap(tap)
             }
 
-            // Load and apply persisted AU effect chains
-            let savedAppAU = settingsManager.getAUEffectChain(for: app.persistenceIdentifier)
-            if !savedAppAU.isEmpty {
-                tap.updateAUEffectChain(savedAppAU) { [weak self] result in
-                    guard let self, case .committed = result else { return }
-                    self.appAU[app.persistenceIdentifier, default: AUChainState()].entries = savedAppAU
-                    self.syncAppAUFailedIDs(for: app)
-                }
+            // AU chains and bypass state are installed by activate(initial:) before
+            // AudioDeviceStart. Record the same state in the engine caches without
+            // scheduling a post-start replacement that would race the first callback.
+            let appIdentifier = app.persistenceIdentifier
+            if !initial.appAUEffectChain.isEmpty || initial.appAUBypassed {
+                appAU[appIdentifier, default: AUChainState()].entries = initial.appAUEffectChain
+                appAU[appIdentifier, default: AUChainState()].isBypassed = initial.appAUBypassed
+                syncAppAUFailedIDs(for: app)
             }
-            let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
-            if !savedDeviceAU.isEmpty && !enrolledDeviceUIDs.contains(deviceUID) {
-                tap.updateDeviceAUEffectChain(savedDeviceAU) { [weak self] result in
-                    guard let self, case .committed = result else { return }
-                    self.deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
-                    self.syncDeviceAUFailedIDs(for: deviceUID)
-                }
+            if !initial.deviceAUEffectChain.isEmpty || initial.deviceAUBypassed {
+                deviceAU[deviceUID, default: AUChainState()].entries = initial.deviceAUEffectChain
+                deviceAU[deviceUID, default: AUChainState()].isBypassed = initial.deviceAUBypassed
+                syncDeviceAUFailedIDs(for: deviceUID)
             }
-
-            loadPersistedAUBypassState(for: app, deviceUID: deviceUID)
 
             logger.debug("Created tap for \(app.name)")
         } catch {

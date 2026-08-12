@@ -431,8 +431,13 @@ final class ProcessTapController: ProcessTapControlling {
 
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { _currentAUEntries }
     var auEffectChainFailedIDs: Set<UUID> { auEffectChain?.failedEntryIDs ?? [] }
+    var auEffectChainTopologyDescriptions: [UUID: String] {
+        guard let chain = auEffectChain else { return [:] }
+        return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
+    }
+    var auAvailableStereoPairs: [AUStereoPair] { currentAUFormat().availableStereoPairs }
     func auEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(auEffectChain) }
-    func getAUHost(for entryID: UUID) -> AUEffectHost? { auEffectChain?.host(for: entryID) }
+    func getAUHost(for entryID: UUID) -> AUEffectHost? { auEffectChain?.editorHost(for: entryID) }
 
     func setAUChainBypassed(_ bypassed: Bool) {
         auEffectChain?.setBypassed(bypassed)
@@ -582,7 +587,6 @@ final class ProcessTapController: ProcessTapControlling {
         guard let token = token as? ProcessTapPreparedDeviceAUChain,
               preparedDeviceAUChains[token.tokenID] === token,
               token.lifecycle == .commitClaimed else { return }
-        closeReplacedPluginWindows(oldChain: token.oldChain, replacementEntries: token.currentEntries)
         publishAUChainPair(
             token.replacement,
             secondary: token.secondaryReplacement,
@@ -591,6 +595,7 @@ final class ProcessTapController: ProcessTapControlling {
             bypassed: token.bypassed,
             entries: token.currentEntries
         )
+        rebindReplacedPluginWindows(oldChain: token.oldChain, replacement: token.replacement, replacementEntries: token.currentEntries)
         updateMaxTailTime()
         _ = token.finishCommit()
         preparedDeviceAUChains.removeValue(forKey: token.tokenID)
@@ -611,8 +616,13 @@ final class ProcessTapController: ProcessTapControlling {
 
     func getDeviceAUEffectChainEntries() -> [AUEffectChainEntry] { _currentDeviceAUEntries }
     var deviceAUEffectChainFailedIDs: Set<UUID> { deviceAUEffectChain?.failedEntryIDs ?? [] }
+    var deviceAUEffectChainTopologyDescriptions: [UUID: String] {
+        guard let chain = deviceAUEffectChain else { return [:] }
+        return Dictionary(uniqueKeysWithValues: chain.entries.map { ($0.id, chain.topologyDescription(for: $0.id)) })
+    }
+    var deviceAUAvailableStereoPairs: [AUStereoPair] { currentAUFormat().availableStereoPairs }
     func deviceAUEffectChainWithLiveState() -> [AUEffectChainEntry]? { snapshotChainState(deviceAUEffectChain) }
-    func getDeviceAUHost(for entryID: UUID) -> AUEffectHost? { deviceAUEffectChain?.host(for: entryID) }
+    func getDeviceAUHost(for entryID: UUID) -> AUEffectHost? { deviceAUEffectChain?.editorHost(for: entryID) }
 
     func setDeviceAUChainBypassed(_ bypassed: Bool) {
         deviceAUEffectChain?.setBypassed(bypassed)
@@ -661,15 +671,24 @@ final class ProcessTapController: ProcessTapControlling {
         return prepared
     }
 
-    private func closeReplacedPluginWindows(
+    private func rebindReplacedPluginWindows(
         oldChain: AUEffectChain?,
+        replacement: AUEffectChain?,
         replacementEntries: [AUEffectChainEntry]
     ) {
         guard let oldChain else { return }
         for oldEntry in oldChain.entries {
             guard let replacementEntry = replacementEntries.first(where: { $0.id == oldEntry.id }),
                   oldChain.canReuseHost(for: replacementEntry) else {
-                AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
+                if let host = replacement?.editorHost(for: oldEntry.id), let au = host.audioUnit {
+                    AUPluginWindowManager.shared.rebindWindow(
+                        for: oldEntry.id,
+                        audioUnit: au,
+                        pluginName: host.descriptor.name
+                    )
+                } else {
+                    AUPluginWindowManager.shared.closeWindow(for: oldEntry.id, save: false)
+                }
                 continue
             }
         }
@@ -720,7 +739,6 @@ final class ProcessTapController: ProcessTapControlling {
                     completion(.rejected(reason: .timedOut))
                     return
                 }
-                self.closeReplacedPluginWindows(oldChain: old, replacementEntries: entries)
                 self.publishAUChainPair(
                     replacement,
                     secondary: secondaryReplacement,
@@ -729,6 +747,7 @@ final class ProcessTapController: ProcessTapControlling {
                     bypassed: bypassed,
                     entries: entries
                 )
+                self.rebindReplacedPluginWindows(oldChain: old, replacement: replacement, replacementEntries: entries)
                 self.updateMaxTailTime()
                 completion(.committed)
             }
@@ -746,12 +765,20 @@ final class ProcessTapController: ProcessTapControlling {
         chain?.setBypassed(bypassed)
         secondary?.setBypassed(bypassed)
         if device {
+            deviceAUEffectChain?.deactivatePeerObservers()
+            secondaryDeviceAUEffectChain?.deactivatePeerObservers()
             deviceAUEffectChain = chain
             if publishSecondary { secondaryDeviceAUEffectChain = secondary }
+            chain?.activatePeerObservers()
+            if publishSecondary { secondary?.activatePeerObservers() }
             _currentDeviceAUEntries = entries
         } else {
+            auEffectChain?.deactivatePeerObservers()
+            secondaryAUEffectChain?.deactivatePeerObservers()
             auEffectChain = chain
             if publishSecondary { secondaryAUEffectChain = secondary }
+            chain?.activatePeerObservers()
+            if publishSecondary { secondary?.activatePeerObservers() }
             _currentAUEntries = entries
         }
     }
@@ -1131,6 +1158,36 @@ final class ProcessTapController: ProcessTapControlling {
         }
         _lastLoudnessVolume = initial.loudnessVolume
 
+        // Publish persisted AU chains before AudioDeviceStart. The first HAL callback
+        // must observe the complete processing graph, just like it observes the
+        // initialized EQ and loudness processors above.
+        let initialAUFormat = currentAUFormat()
+        if !initial.appAUEffectChain.isEmpty {
+            let chain = AUEffectChain(
+                entries: initial.appAUEffectChain,
+                sampleRate: initialAUFormat.sampleRate,
+                format: initialAUFormat
+            )
+            chain.setBypassed(initial.appAUBypassed)
+            auEffectChain = chain
+        } else {
+            auEffectChain = nil
+        }
+        if !initial.deviceAUEffectChain.isEmpty {
+            let chain = AUEffectChain(
+                entries: initial.deviceAUEffectChain,
+                sampleRate: initialAUFormat.sampleRate,
+                format: initialAUFormat
+            )
+            chain.setBypassed(initial.deviceAUBypassed)
+            deviceAUEffectChain = chain
+        } else {
+            deviceAUEffectChain = nil
+        }
+        _currentAUEntries = initial.appAUEffectChain
+        _currentDeviceAUEntries = initial.deviceAUEffectChain
+        updateMaxTailTime()
+
         // Create IO proc with gain processing
         nextCallbackID += 1
         _primaryCallbackID = nextCallbackID
@@ -1507,9 +1564,11 @@ final class ProcessTapController: ProcessTapControlling {
 
         if !_currentAUEntries.isEmpty {
             secondaryAUEffectChain = AUEffectChain(entries: _currentAUEntries, sampleRate: sampleRate, format: currentAUFormat())
+            secondaryAUEffectChain?.setBypassed(auEffectChain?.isBypassed == true)
         }
         if !_currentDeviceAUEntries.isEmpty {
             secondaryDeviceAUEffectChain = AUEffectChain(entries: _currentDeviceAUEntries, sampleRate: sampleRate, format: currentAUFormat())
+            secondaryDeviceAUEffectChain?.setBypassed(deviceAUEffectChain?.isBypassed == true)
         }
 
         nextCallbackID += 1
@@ -1750,11 +1809,13 @@ final class ProcessTapController: ProcessTapControlling {
             if !_currentAUEntries.isEmpty {
                 let oldChain = auEffectChain
                 auEffectChain = AUEffectChain(entries: _currentAUEntries, sampleRate: deviceSampleRate, format: format)
+                auEffectChain?.setBypassed(oldChain?.isBypassed == true)
                 if let oldChain { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldChain } }
             }
             if !_currentDeviceAUEntries.isEmpty {
                 let oldChain = deviceAUEffectChain
                 deviceAUEffectChain = AUEffectChain(entries: _currentDeviceAUEntries, sampleRate: deviceSampleRate, format: format)
+                deviceAUEffectChain?.setBypassed(oldChain?.isBypassed == true)
                 if let oldChain { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldChain } }
             }
             updateMaxTailTime()

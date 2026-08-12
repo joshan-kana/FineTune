@@ -25,7 +25,7 @@ jq -n \
     --arg commit "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
     --arg upstream "$(git -C "$REPO_ROOT" rev-parse upstream/main 2>/dev/null || printf unknown)" \
     --arg version "$version" \
-    --arg xcode "$(xcodebuild -version | tr '\n' ' ')" \
+    --arg xcode "$(xcodebuild_host -version | tr '\n' ' ')" \
     --arg sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     --arg architecture "arm64 x86_64" \
     --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

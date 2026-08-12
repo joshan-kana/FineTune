@@ -654,6 +654,8 @@ struct MenuBarPopupView: View {
                             audioEngine.openDeviceAUPluginUI(deviceUID: device.uid, entryID: $0, forceGeneric: true)
                         },
                         deviceAUFailedEntryIDs: audioEngine.getDeviceAUFailedEntryIDs(deviceUID: device.uid),
+                        deviceAUTopologyDescriptions: audioEngine.getDeviceAUProcessingTopologyDescriptions(deviceUID: device.uid),
+                        deviceAUAvailableStereoPairs: audioEngine.getDeviceAUAvailableStereoPairs(deviceUID: device.uid),
                         getDeviceAUFactoryPresets: {
                             audioEngine.getDeviceAUFactoryPresets(deviceUID: device.uid, entryID: $0)
                         },
@@ -663,6 +665,9 @@ struct MenuBarPopupView: View {
                                 entryID: id,
                                 presetIndex: preset
                             )
+                        },
+                        onUpdateDeviceAUEntry: { entry in
+                            audioEngine.updateDeviceAUProcessingMode(deviceUID: device.uid, entry: entry)
                         }
                     )
                     .id(PopupKeyboardNavModel.RowID.device(uid: device.uid))
@@ -981,8 +986,11 @@ struct MenuBarPopupView: View {
                 onOpenAUUI: { id in audioEngine.openAUPluginUI(for: app, entryID: id) },
                 onOpenAUGenericUI: { id in audioEngine.openAUPluginUI(for: app, entryID: id, forceGeneric: true) },
                 auFailedEntryIDs: audioEngine.getAUFailedEntryIDs(for: app),
+                auTopologyDescriptions: audioEngine.getAUProcessingTopologyDescriptions(for: app),
+                auAvailableStereoPairs: audioEngine.getAUAvailableStereoPairs(for: app),
                 getAUFactoryPresets: { id in audioEngine.getAUFactoryPresets(for: app, entryID: id) },
-                onSelectAUFactoryPreset: { id, preset in audioEngine.selectAUFactoryPreset(for: app, entryID: id, presetIndex: preset) }
+                onSelectAUFactoryPreset: { id, preset in audioEngine.selectAUFactoryPreset(for: app, entryID: id, presetIndex: preset) },
+                onUpdateAUEntry: { entry in audioEngine.updateAUProcessingMode(for: app, entry: entry) }
             )
             .id(PopupKeyboardNavModel.RowID.app(persistenceID: displayableApp.id))
         }

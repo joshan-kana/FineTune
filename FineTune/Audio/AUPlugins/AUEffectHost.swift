@@ -14,6 +14,81 @@ private func auPeerEventListener(
     host.notifyParameterChange(event.pointee.mArgument.mParameter, value: value)
 }
 
+/// Chooses a safe topology after an Audio Unit rejects the device's native
+/// layout. The capability list is injected by the host during preparation and
+/// can be replaced with a mock in tests without loading a product AU.
+enum AUProcessingTopology: Equatable {
+    case native
+    case independentPerChannel
+    case singleStereoPair(AUStereoPair)
+    case linkedStereoPairs([AUStereoPair])
+    /// Kept for source compatibility with the initial Phase A tests and
+    /// callers. New active chains use `singleStereoPair(.front)`.
+    case frontStereoPassThrough
+    case unsupported
+
+    static func choose(
+        mode: AUProcessingMode,
+        channelCount: Int,
+        nativeCanProcess: Bool,
+        supportedChannelCounts: [(input: Int, output: Int)],
+        hasFrontStereoPair: Bool = true,
+        requestedPair: AUStereoPair = .front,
+        availableStereoPairs: Set<AUStereoPair>? = nil
+    ) -> Self {
+        if mode == .bypassForLayout { return .unsupported }
+        if mode == .stereoOnly { return channelCount == 2 && nativeCanProcess ? .native : .unsupported }
+        if mode == .nativeMultichannel { return nativeCanProcess ? .native : .unsupported }
+        if mode == .singleStereoPair {
+            let pairAvailable = availableStereoPairs?.contains(requestedPair) ?? (requestedPair == .front && hasFrontStereoPair)
+            return channelCount > 2 && pairAvailable && supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts)
+                ? .singleStereoPair(requestedPair) : .unsupported
+        }
+        if mode == .linkedStereoPairs {
+            guard channelCount > 2,
+                  let pairs = availableStereoPairs,
+                  !pairs.isEmpty,
+                  supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts) else {
+                return .unsupported
+            }
+            return .linkedStereoPairs(AUStereoPair.allCases.filter { pairs.contains($0) })
+        }
+        if mode == .independentPerChannel {
+            return channelCount > 1 && supports(
+                input: 1,
+                output: 1,
+                supportedChannelCounts: supportedChannelCounts
+            ) ? .independentPerChannel : (nativeCanProcess ? .native : .unsupported)
+        }
+        if nativeCanProcess { return .native }
+        guard channelCount > 2 else { return .unsupported }
+        if hasFrontStereoPair,
+           supports(input: 2, output: 2, supportedChannelCounts: supportedChannelCounts) {
+            return .singleStereoPair(.front)
+        }
+        if supports(input: 1, output: 1, supportedChannelCounts: supportedChannelCounts) {
+            return .independentPerChannel
+        }
+        return .unsupported
+    }
+
+    private static func supports(
+        input: Int,
+        output: Int,
+        supportedChannelCounts: [(input: Int, output: Int)]
+    ) -> Bool {
+        guard !supportedChannelCounts.isEmpty else { return input <= 2 && output <= 2 }
+        return supportedChannelCounts.contains {
+            AUChannelCapabilityMatcher.matches(
+                input: $0.input,
+                output: $0.output,
+                requestedInput: input,
+                requestedOutput: output
+            )
+        }
+    }
+}
+
 /// Real-time-safe host for one Audio Unit instance.
 ///
 /// Audio Units are prepared, negotiated, and initialized before the render
@@ -29,6 +104,7 @@ final class AUEffectHost: @unchecked Sendable {
     private nonisolated(unsafe) var _audioUnit: AudioUnit?
     private nonisolated(unsafe) var _isEnabled: Bool
     private nonisolated(unsafe) var _sampleTime: Float64 = 0
+    private nonisolated(unsafe) var _lastRenderStatus: OSStatus = noErr
     private var parameterListener: AUEventListenerRef?
     private var parameterChangeHandler: ((AudioUnitParameter, AudioUnitParameterValue) -> Void)?
     private var observedParameters: [AudioUnitParameter] = []
@@ -55,6 +131,8 @@ final class AUEffectHost: @unchecked Sendable {
 
     var isEnabled: Bool { _isEnabled }
     var audioUnit: AudioUnit? { _audioUnit }
+    var lastRenderStatus: OSStatus { _lastRenderStatus }
+    var hasRenderFailed: Bool { _lastRenderStatus != noErr }
 
     #if DEBUG
     private var peerParameterSetterForTesting: ((AudioUnitParameterValue) -> OSStatus)?
@@ -71,16 +149,18 @@ final class AUEffectHost: @unchecked Sendable {
     var compatibilityDescription: String {
         guard canProcessCurrentLayout else {
             if processingMode == .stereoOnly && format.channelCount != 2 {
-                return "Stereo only — bypassed on (format.shortLabel)"
+                return "Stereo only — bypassed on \(format.shortLabel)"
             }
-            return "Unsupported (format.shortLabel) layout — audio preserved"
+            return "Unsupported \(format.shortLabel) layout — audio preserved"
         }
         switch processingMode {
-        case .nativeMultichannel: return "Native (format.shortLabel)"
-        case .independentPerChannel: return "Independent ×(format.channelCount)"
+        case .nativeMultichannel: return "Native \(format.shortLabel)"
+        case .independentPerChannel: return "Independent ×\(format.channelCount)"
         case .stereoOnly: return "Stereo only"
+        case .singleStereoPair: return "Stereo pair"
+        case .linkedStereoPairs: return "Linked stereo pairs"
         case .bypassForLayout: return "Bypass for this layout"
-        case .auto: return format.channelCount > 2 ? "Native (format.shortLabel)" : "Native stereo"
+        case .auto: return format.channelCount > 2 ? "Native \(format.shortLabel)" : "Native stereo"
         }
     }
 
@@ -346,7 +426,12 @@ final class AUEffectHost: @unchecked Sendable {
         timestamp.mFlags = .sampleTimeValid
         timestamp.mSampleTime = _sampleTime
         _sampleTime += Float64(count)
-        guard let au = _audioUnit, AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL) == noErr else { return }
+        guard let au = _audioUnit else { return }
+        let renderStatus = AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL)
+        guard renderStatus == noErr else {
+            if _lastRenderStatus == noErr { _lastRenderStatus = renderStatus }
+            return
+        }
 
         copyFromPlanar(buffers, frameCount: count)
     }
@@ -371,8 +456,68 @@ final class AUEffectHost: @unchecked Sendable {
         timestamp.mFlags = .sampleTimeValid
         timestamp.mSampleTime = _sampleTime
         _sampleTime += Float64(count)
-        guard let au = _audioUnit, AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL) == noErr else { return }
+        guard let au = _audioUnit else { return }
+        let renderStatus = AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL)
+        guard renderStatus == noErr else {
+            if _lastRenderStatus == noErr { _lastRenderStatus = renderStatus }
+            return
+        }
         for frame in 0..<count { samples[frame * safeStride] = output[frame] }
+    }
+
+    /// Processes only the semantic front-left/front-right pair of a larger
+    /// layout. The other channels are not copied into the AU and are not
+    /// written back, so they remain byte-for-byte unchanged on success.
+    @inline(__always)
+    func renderFrontStereo(
+        buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int,
+        channelIndices: (left: Int, right: Int)
+    ) {
+        renderStereoPair(buffers: buffers, frameCount: frameCount, channelIndices: channelIndices)
+    }
+
+    /// Processes exactly one semantic stereo pair. The host itself is always
+    /// negotiated as stereo, while the destination buffer can be any larger
+    /// interleaved or non-interleaved stream.
+    @inline(__always)
+    func renderStereoPair(
+        buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int,
+        channelIndices: (left: Int, right: Int)
+    ) {
+        guard _isEnabled, canProcessCurrentLayout, format.channelCount == 2, _audioUnit != nil,
+              channelIndices.left >= 0, channelIndices.right >= 0,
+              channelIndices.left != channelIndices.right else { return }
+        let count = min(max(0, frameCount), _bufferCapacity)
+        guard count > 0 else { return }
+        guard renderHandoff.beginRender() else { return }
+        defer { renderHandoff.endRender() }
+        guard let leftInput = _inputChannels[0], let rightInput = _inputChannels[1],
+              let leftOutput = _outputChannels[0], let rightOutput = _outputChannels[1],
+              copyChannelToPlanar(buffers, sourceChannel: channelIndices.left, destination: leftInput, frameCount: count),
+              copyChannelToPlanar(buffers, sourceChannel: channelIndices.right, destination: rightInput, frameCount: count) else { return }
+
+        let byteCount = UInt32(count * MemoryLayout<Float>.size)
+        let renderBuffers = UnsafeMutableAudioBufferListPointer(_renderABL)
+        _renderABL.pointee.mNumberBuffers = 2
+        renderBuffers[0] = AudioBuffer(mNumberChannels: 1, mDataByteSize: byteCount, mData: leftOutput)
+        renderBuffers[1] = AudioBuffer(mNumberChannels: 1, mDataByteSize: byteCount, mData: rightOutput)
+
+        var flags = AudioUnitRenderActionFlags(rawValue: 0)
+        var timestamp = AudioTimeStamp()
+        timestamp.mFlags = .sampleTimeValid
+        timestamp.mSampleTime = _sampleTime
+        _sampleTime += Float64(count)
+        guard let au = _audioUnit else { return }
+        let renderStatus = AudioUnitRender(au, &flags, &timestamp, 0, UInt32(count), _renderABL)
+        guard renderStatus == noErr else {
+            if _lastRenderStatus == noErr { _lastRenderStatus = renderStatus }
+            return
+        }
+
+        _ = copyPlanarToChannel(leftOutput, destination: buffers, destinationChannel: channelIndices.left, frameCount: count)
+        _ = copyPlanarToChannel(rightOutput, destination: buffers, destinationChannel: channelIndices.right, frameCount: count)
     }
 
     // MARK: - Presets and diagnostics
@@ -594,6 +739,60 @@ final class AUEffectHost: @unchecked Sendable {
             }
             channel += channels
         }
+    }
+
+    @inline(__always)
+    private func copyChannelToPlanar(
+        _ buffers: UnsafeMutableAudioBufferListPointer,
+        sourceChannel: Int,
+        destination: UnsafeMutablePointer<Float>,
+        frameCount: Int
+    ) -> Bool {
+        var channel = 0
+        for buffer in buffers {
+            let channels = max(1, Int(buffer.mNumberChannels))
+            guard sourceChannel >= channel, sourceChannel < channel + channels else {
+                channel += channels
+                continue
+            }
+            guard let data = buffer.mData else { return false }
+            let samples = data.assumingMemoryBound(to: Float.self)
+            let local = sourceChannel - channel
+            if channels == 1 {
+                memcpy(destination, samples, frameCount * MemoryLayout<Float>.size)
+            } else {
+                for frame in 0..<frameCount { destination[frame] = samples[frame * channels + local] }
+            }
+            return true
+        }
+        return false
+    }
+
+    @inline(__always)
+    private func copyPlanarToChannel(
+        _ source: UnsafeMutablePointer<Float>,
+        destination buffers: UnsafeMutableAudioBufferListPointer,
+        destinationChannel: Int,
+        frameCount: Int
+    ) -> Bool {
+        var channel = 0
+        for index in 0..<buffers.count {
+            let channels = max(1, Int(buffers[index].mNumberChannels))
+            guard destinationChannel >= channel, destinationChannel < channel + channels else {
+                channel += channels
+                continue
+            }
+            guard let data = buffers[index].mData else { return false }
+            let samples = data.assumingMemoryBound(to: Float.self)
+            let local = destinationChannel - channel
+            if channels == 1 {
+                memcpy(samples, source, frameCount * MemoryLayout<Float>.size)
+            } else {
+                for frame in 0..<frameCount { samples[frame * channels + local] = source[frame] }
+            }
+            return true
+        }
+        return false
     }
 }
 
