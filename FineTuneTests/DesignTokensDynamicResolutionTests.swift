@@ -42,14 +42,11 @@ struct DesignTokensDynamicResolutionTests {
         let actualSRGB = actual.usingColorSpace(.sRGB) ?? actual
         let expectedSRGB = expected.usingColorSpace(.sRGB) ?? expected
         let tol: CGFloat = 0.005
-        #expect(
-            abs(actualSRGB.redComponent - expectedSRGB.redComponent) < tol &&
-            abs(actualSRGB.greenComponent - expectedSRGB.greenComponent) < tol &&
-            abs(actualSRGB.blueComponent - expectedSRGB.blueComponent) < tol &&
-            abs(actualSRGB.alphaComponent - expectedSRGB.alphaComponent) < tol,
-            "Token in \(appearance.name.rawValue) resolved to RGBA(\(actualSRGB.redComponent), \(actualSRGB.greenComponent), \(actualSRGB.blueComponent), \(actualSRGB.alphaComponent)) but expected RGBA(\(expectedSRGB.redComponent), \(expectedSRGB.greenComponent), \(expectedSRGB.blueComponent), \(expectedSRGB.alphaComponent))",
-            sourceLocation: sourceLocation
-        )
+        let context = "Token in \(appearance.name.rawValue) resolved to RGBA(\(actualSRGB.redComponent), \(actualSRGB.greenComponent), \(actualSRGB.blueComponent), \(actualSRGB.alphaComponent)) but expected RGBA(\(expectedSRGB.redComponent), \(expectedSRGB.greenComponent), \(expectedSRGB.blueComponent), \(expectedSRGB.alphaComponent))"
+        #expect(abs(actualSRGB.redComponent - expectedSRGB.redComponent) < tol, "\(context) [red]", sourceLocation: sourceLocation)
+        #expect(abs(actualSRGB.greenComponent - expectedSRGB.greenComponent) < tol, "\(context) [green]", sourceLocation: sourceLocation)
+        #expect(abs(actualSRGB.blueComponent - expectedSRGB.blueComponent) < tol, "\(context) [blue]", sourceLocation: sourceLocation)
+        #expect(abs(actualSRGB.alphaComponent - expectedSRGB.alphaComponent) < tol, "\(context) [alpha]", sourceLocation: sourceLocation)
     }
 
     private static let aqua = NSAppearance(named: .aqua)!

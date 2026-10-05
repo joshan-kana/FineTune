@@ -5,6 +5,7 @@ SCRIPT_DIR="${FINETUNE_SCRIPT_ROOT:-$(cd -- "$(dirname -- "$0")" && pwd)}"
 source "$SCRIPT_DIR/lib/common.sh"
 
 ensure_repo
+"$SCRIPT_DIR/ci/test-xcode-environment"
 "$SCRIPT_DIR/lint"
 "$SCRIPT_DIR/ci/test-workflow-logic"
 if command -v nix >/dev/null 2>&1; then nix flake check --no-build "$REPO_ROOT"; fi

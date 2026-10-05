@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+source "$SCRIPT_DIR/lib/xcode.sh"
+
+probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/finetune-xcode-env.XXXXXX")"
+trap 'rm -r -- "$probe_dir"' EXIT
+ln -s /usr/bin/env "$probe_dir/xcodebuild"
+
+original_path="$PATH"
+export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+export PATH="$probe_dir:$PATH"
+export SWIFTPM_DISABLE_SANDBOX=1
+export IDEPackageSupportDisableManifestSandbox=YES
+export XBS_DISABLE_SANDBOXED_BUILDS=1
+export CFPREFERENCES_AVOID_DAEMON=1
+
+export SDKROOT=/tmp/prohibited-sdkroot
+export CC=/tmp/prohibited-cc
+export CXX=/tmp/prohibited-cxx
+export LD=/tmp/prohibited-ld
+export AR=/tmp/prohibited-ar
+export LIBTOOL=/tmp/prohibited-libtool
+export LDFLAGS=-Wl,prohibited
+export CFLAGS=-isystem/tmp/prohibited
+export CXXFLAGS=-isystem/tmp/prohibited
+export SWIFTFLAGS=-Xfrontend
+export NIX_LDFLAGS=-L/tmp/prohibited
+export NIX_CFLAGS_COMPILE=-I/tmp/prohibited
+export NIX_CC=/tmp/prohibited-nix-cc
+export NIX_BINTOOLS=/tmp/prohibited-nix-bintools
+export DYLD_LIBRARY_PATH=/tmp/prohibited-dyld
+export LIBRARY_PATH=/tmp/prohibited-library
+export CPATH=/tmp/prohibited-cpath
+
+captured_environment="$(xcodebuild_host)"
+[[ "$PATH" == "$probe_dir:$original_path" ]] || {
+    printf '%s\n' 'xcodebuild changed PATH unexpectedly' >&2
+    exit 1
+}
+
+for name in "${XCODE_TOOLCHAIN_ENVIRONMENT[@]}"; do
+    if grep -q "^$name=" <<<"$captured_environment"; then
+        printf 'prohibited variable reached xcodebuild: %s\n' "$name" >&2
+        exit 1
+    fi
+done
+
+for name in SWIFTPM_DISABLE_SANDBOX IDEPackageSupportDisableManifestSandbox XBS_DISABLE_SANDBOXED_BUILDS CFPREFERENCES_AVOID_DAEMON; do
+    grep -q "^$name=" <<<"$captured_environment" || {
+        printf 'required SwiftPM/build variable was lost before xcodebuild: %s\n' "$name" >&2
+        exit 1
+    }
+done
+
+printf '%s\n' 'Xcode host environment regression check passed'

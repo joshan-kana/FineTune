@@ -14,7 +14,7 @@ info "running FineTune tests"
 export SWIFTPM_DISABLE_SANDBOX=1
 export IDEPackageSupportDisableManifestSandbox=YES
 set +e
-xcodebuild test -project "$(project_file)" -scheme "$(scheme_name)" -destination 'platform=macOS' \
+xcodebuild_host test -project "$(project_file)" -scheme "$(scheme_name)" -destination 'platform=macOS' \
     -parallel-testing-enabled NO \
     -derivedDataPath "$DERIVED_DATA" -resultBundlePath "$result_bundle" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \

@@ -36,6 +36,10 @@ final class RecordingProcessTapController: ProcessTapControlling {
         var loudnessVolume: Float
         var loudnessCompensationEnabled: Bool
         var loudnessEqualizerSettings: LoudnessEqualizerSettings
+        var appAUEffectChain: [AUEffectChainEntry]
+        var appAUBypassed: Bool
+        var deviceAUEffectChain: [AUEffectChainEntry]
+        var deviceAUBypassed: Bool
 
         @MainActor
         init(_ s: TapInitialState) {
@@ -45,6 +49,10 @@ final class RecordingProcessTapController: ProcessTapControlling {
             self.loudnessVolume = s.loudnessVolume
             self.loudnessCompensationEnabled = s.loudnessCompensationEnabled
             self.loudnessEqualizerSettings = s.loudnessEqualizerSettings
+            self.appAUEffectChain = s.appAUEffectChain
+            self.appAUBypassed = s.appAUBypassed
+            self.deviceAUEffectChain = s.deviceAUEffectChain
+            self.deviceAUBypassed = s.deviceAUBypassed
         }
     }
 
@@ -495,6 +503,34 @@ struct AudioEngineTapInitialStateTests {
 
         let snap = try #require(capturedInitial(fix))
         #expect(snap.loudnessEqualizerSettings.enabled == value)
+    }
+
+    @Test("Persisted app and primary-device AU state is present before activation")
+    func auStateIsCarriedIntoActivation() throws {
+        let fix = makeFixture()
+        let appEntry = AUEffectChainEntry(plugin: testPlugin())
+        let deviceEntry = AUEffectChainEntry(plugin: testPlugin())
+        fix.settings.setAUEffectChain([appEntry], for: fix.app.persistenceIdentifier)
+        fix.settings.setDeviceAUEffectChain([deviceEntry], for: fix.device.uid)
+        fix.settings.setAppAUBypassed(true, for: fix.app.persistenceIdentifier)
+        fix.settings.setDeviceAUBypassed(true, for: fix.device.uid)
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+
+        let tap = try #require(fix.lastTap())
+        let snap = try #require(capturedInitial(fix))
+        #expect(snap.appAUEffectChain == [appEntry])
+        #expect(snap.appAUBypassed)
+        #expect(snap.deviceAUEffectChain == [deviceEntry])
+        #expect(snap.deviceAUBypassed)
+        #expect(!tap.events.contains { event in
+            if case .updateAUEffectChain = event { return true }
+            return false
+        })
+        #expect(!tap.events.contains { event in
+            if case .updateDeviceAUEffectChain = event { return true }
+            return false
+        })
     }
 
     @Test("loudnessVolume = currentDeviceVolume × per-app volume")
@@ -972,10 +1008,13 @@ struct AudioEngineDeviceAUEnrollmentTests {
         fix.engine.setDevice(for: postCommitApp, deviceUID: fix.device.uid)
         let postCommitTap = try #require(fix.allTaps().last)
         #expect(postCommitTap.devicePrepareRequestCount == 0)
-        #expect(postCommitTap.events.contains { event in
-            if case .updateDeviceAUEffectChain(let entries) = event {
-                return entries.count == 1
-            }
+        let postCommitInitial = postCommitTap.events.compactMap { event -> RecordingProcessTapController.TapInitialStateSnapshot? in
+            if case let .activate(snapshot) = event { return snapshot }
+            return nil
+        }.first
+        #expect(postCommitInitial?.deviceAUEffectChain.count == 1)
+        #expect(!postCommitTap.events.contains { event in
+            if case .updateDeviceAUEffectChain = event { return true }
             return false
         })
     }

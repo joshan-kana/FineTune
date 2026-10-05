@@ -201,6 +201,8 @@ struct AUEffectChainEntryTests {
         entry.isEnabled = false
         entry.presetData = Data([0x01, 0x02, 0x03])
         entry.selectedFactoryPresetIndex = 5
+        entry.processingMode = .singleStereoPair
+        entry.selectedStereoPair = .rear
 
         let data = try JSONEncoder().encode(entry)
         let decoded = try JSONDecoder().decode(AUEffectChainEntry.self, from: data)
@@ -209,6 +211,19 @@ struct AUEffectChainEntryTests {
         #expect(decoded.isEnabled == false)
         #expect(decoded.presetData == Data([0x01, 0x02, 0x03]))
         #expect(decoded.selectedFactoryPresetIndex == 5)
+        #expect(decoded.processingMode == .singleStereoPair)
+        #expect(decoded.selectedStereoPair == .rear)
+    }
+
+    @Test("Old entries decode with Auto and no pair target")
+    func decodesLegacyEntry() throws {
+        let entry = AUEffectChainEntry(plugin: makePlugin())
+        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+        object.removeValue(forKey: "selectedStereoPair")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(AUEffectChainEntry.self, from: data)
+        #expect(decoded.processingMode == .auto)
+        #expect(decoded.selectedStereoPair == nil)
     }
 
     @Test("Equatable compares by ID")
@@ -337,6 +352,223 @@ struct AUChannelCapabilityMatcherTests {
         #expect(AUChannelCapabilityMatcher.matches(input: capability.input, output: capability.output, requestedInput: 6, requestedOutput: 6) == false)
         #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 6, requestedOutput: 6))
         #expect(AUChannelCapabilityMatcher.matches(input: -1, output: -8, requestedInput: 8, requestedOutput: 8))
+    }
+}
+
+@Suite("AU processing topology")
+struct AUProcessingTopologyTests {
+    @Test("A mock stereo-capable AU can fall back after native initialization rejects HDMI")
+    func retriesSupportedFallbackAfterNativeFailure() {
+        // This models FabFilter Pro-C 2 and BABY Audio Comeback: their mock
+        // capability table accepts mono/stereo but rejects an 8-channel bus.
+        let mockCapabilities = [(input: 1, output: 1), (input: 2, output: 2)]
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 8,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities
+            ) == .singleStereoPair(.front)
+        )
+    }
+
+    @Test("A stereo-only AU uses the front stereo pass-through on multichannel output")
+    func selectsFrontStereoPassThrough() {
+        let mockCapabilities = [(input: 2, output: 2)]
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 8,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities
+            ) == .singleStereoPair(.front)
+        )
+        #expect(
+            AUProcessingTopology.choose(
+                mode: .auto,
+                channelCount: 6,
+                nativeCanProcess: false,
+                supportedChannelCounts: mockCapabilities,
+                hasFrontStereoPair: false
+            ) == .unsupported
+        )
+    }
+
+    @Test("Explicit modes are not silently replaced by the stereo fallback")
+    func preservesExplicitModes() {
+        let stereoOnly = [(input: 2, output: 2)]
+        #expect(AUProcessingTopology.choose(mode: .nativeMultichannel, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(mode: .stereoOnly, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(mode: .bypassForLayout, channelCount: 8, nativeCanProcess: false, supportedChannelCounts: stereoOnly) == .unsupported)
+        #expect(AUProcessingTopology.choose(
+            mode: .singleStereoPair,
+            channelCount: 6,
+            nativeCanProcess: false,
+            supportedChannelCounts: stereoOnly,
+            requestedPair: .rear,
+            availableStereoPairs: [.front, .side]
+        ) == .unsupported)
+        #expect(AUProcessingTopology.choose(
+            mode: .linkedStereoPairs,
+            channelCount: 8,
+            nativeCanProcess: false,
+            supportedChannelCounts: stereoOnly,
+            availableStereoPairs: [.front, .side, .rear]
+        ) == .linkedStereoPairs([.front, .side, .rear]))
+    }
+}
+
+@Suite("Semantic multichannel topology")
+struct SemanticMultichannelTopologyTests {
+    @Test("7.1 resolves front, side, and rear without pairing centre or LFE")
+    func sevenOnePairs() {
+        let format = AudioStreamFormatDescription(sampleRate: 48_000, channelCount: 8, isInterleaved: true)
+        #expect(format.availableStereoPairs == [.front, .side, .rear])
+        #expect(format.stereoPairChannelIndices(for: .front)?.left == 0)
+        #expect(format.stereoPairChannelIndices(for: .side)?.left == 4)
+        #expect(format.stereoPairChannelIndices(for: .rear)?.left == 6)
+    }
+
+    @Test("5.1 exposes the surround pair as side and has no rear guess")
+    func fiveOnePairs() {
+        let format = AudioStreamFormatDescription(sampleRate: 48_000, channelCount: 6, isInterleaved: false)
+        #expect(format.availableStereoPairs == [.front, .side])
+        #expect(format.stereoPairChannelIndices(for: .rear) == nil)
+    }
+
+    @Test("Unknown layouts do not guess odd/even pairs")
+    func unknownLayoutDoesNotGuess() {
+        let format = AudioStreamFormatDescription(
+            sampleRate: 48_000,
+            channelCount: 4,
+            isInterleaved: true,
+            channelLayoutTag: 0,
+            channelRoles: [.unknown, .unknown, .unknown, .unknown]
+        )
+        #expect(format.availableStereoPairs.isEmpty)
+    }
+}
+
+@Suite("Front stereo multichannel routing")
+struct FrontStereoRoutingTests {
+    @Test("An 8-channel output processes only front L/R")
+    func sevenOnePreservesRemainingChannels() throws {
+        try assertFrontStereoRouting(channelCount: 8)
+    }
+
+    @Test("A 5.1 output does not pair centre or LFE")
+    func fiveOnePreservesCentreLFEAndSurrounds() throws {
+        try assertFrontStereoRouting(channelCount: 6)
+    }
+
+    private func assertFrontStereoRouting(channelCount: Int) throws {
+        let format = AudioStreamFormatDescription(
+            sampleRate: 44_100,
+            frameCapacity: 256,
+            channelCount: channelCount,
+            isInterleaved: true
+        )
+        let indices = try #require(format.frontStereoChannelIndices)
+        let host = AUEffectHost(
+            descriptor: lowPassFilter(),
+            entryID: UUID(),
+            sampleRate: format.sampleRate,
+            maxFrames: format.frameCapacity,
+            format: AudioStreamFormatDescription(
+                sampleRate: format.sampleRate,
+                frameCapacity: format.frameCapacity,
+                channelCount: 2,
+                isInterleaved: false,
+                channelLayoutTag: kAudioChannelLayoutTag_Stereo
+            ),
+            processingMode: .stereoOnly
+        )
+        #expect(host.instantiate())
+        guard let au = host.audioUnit else { return }
+        AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 100, 0)
+
+        let frameCount = 256
+        let abl = FrontStereoTestABL(channels: channelCount, frames: frameCount)
+        let original = abl.samples
+        for _ in 0..<12 {
+            abl.resetFrontSine(sampleRate: format.sampleRate)
+            host.renderFrontStereo(
+                buffers: abl.bufferList,
+                frameCount: frameCount,
+                channelIndices: indices
+            )
+        }
+        let output = abl.samples
+        var frontChanged = false
+        for frame in 0..<frameCount {
+            let base = frame * channelCount
+            let leftChanged = output[base] != original[base]
+            let rightChanged = output[base + 1] != original[base + 1]
+            if leftChanged || rightChanged {
+                frontChanged = true
+                break
+            }
+        }
+        #expect(frontChanged)
+        for channel in 2..<channelCount {
+            for frame in 0..<frameCount {
+                #expect(output[frame * channelCount + channel] == original[frame * channelCount + channel])
+            }
+        }
+    }
+
+    private func lowPassFilter() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C706173,
+            componentManufacturer: 0x6170706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+}
+
+private final class FrontStereoTestABL {
+    nonisolated(unsafe) let pointer: UnsafeMutablePointer<AudioBufferList>
+    nonisolated(unsafe) private let data: UnsafeMutablePointer<Float>
+    let channels: Int
+    let frames: Int
+
+    init(channels: Int, frames: Int) {
+        self.channels = channels
+        self.frames = frames
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: MemoryLayout<AudioBufferList>.size,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        pointer = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+        data = .allocate(capacity: channels * frames)
+        data.initialize(repeating: 0, count: channels * frames)
+        pointer.pointee.mNumberBuffers = 1
+        UnsafeMutableAudioBufferListPointer(pointer)[0] = AudioBuffer(
+            mNumberChannels: UInt32(channels),
+            mDataByteSize: UInt32(channels * frames * MemoryLayout<Float>.size),
+            mData: UnsafeMutableRawPointer(data)
+        )
+        resetFrontSine(sampleRate: 44_100)
+    }
+
+    var bufferList: UnsafeMutableAudioBufferListPointer { UnsafeMutableAudioBufferListPointer(pointer) }
+    var samples: [Float] { Array(UnsafeBufferPointer(start: data, count: channels * frames)) }
+
+    func resetFrontSine(sampleRate: Double) {
+        for frame in 0..<frames {
+            let sample = sinf(2 * .pi * 15_000 * Float(frame) / Float(sampleRate))
+            for channel in 0..<channels {
+                data[frame * channels + channel] = channel < 2 ? sample : Float(channel + 1)
+            }
+        }
+    }
+
+    deinit {
+        data.deallocate()
+        pointer.deallocate()
     }
 }
 

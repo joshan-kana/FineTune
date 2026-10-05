@@ -49,8 +49,11 @@ struct AppRow: View {
     let onOpenAUUI: (UUID) -> Void
     let onOpenAUGenericUI: (UUID) -> Void
     let auFailedEntryIDs: Set<UUID>
+    let auTopologyDescriptions: [UUID: String]
+    let auAvailableStereoPairs: [AUStereoPair]
     let getAUFactoryPresets: (UUID) -> [(index: Int, name: String)]
     let onSelectAUFactoryPreset: (UUID, Int) -> Void
+    let onUpdateAUEntry: (AUEffectChainEntry) -> Void
 
     @State private var isIconHovered = false
     @State private var localEQSettings: EQSettings
@@ -99,8 +102,11 @@ struct AppRow: View {
         onOpenAUUI: @escaping (UUID) -> Void = { _ in },
         onOpenAUGenericUI: @escaping (UUID) -> Void = { _ in },
         auFailedEntryIDs: Set<UUID> = [],
+        auTopologyDescriptions: [UUID: String] = [:],
+        auAvailableStereoPairs: [AUStereoPair] = [],
         getAUFactoryPresets: @escaping (UUID) -> [(index: Int, name: String)] = { _ in [] },
-        onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in }
+        onSelectAUFactoryPreset: @escaping (UUID, Int) -> Void = { _, _ in },
+        onUpdateAUEntry: @escaping (AUEffectChainEntry) -> Void = { _ in }
     ) {
         self.app = app
         self.volume = volume
@@ -145,8 +151,11 @@ struct AppRow: View {
         self.onOpenAUUI = onOpenAUUI
         self.onOpenAUGenericUI = onOpenAUGenericUI
         self.auFailedEntryIDs = auFailedEntryIDs
+        self.auTopologyDescriptions = auTopologyDescriptions
+        self.auAvailableStereoPairs = auAvailableStereoPairs
         self.getAUFactoryPresets = getAUFactoryPresets
         self.onSelectAUFactoryPreset = onSelectAUFactoryPreset
+        self.onUpdateAUEntry = onUpdateAUEntry
         // Initialize local EQ state for reactive UI updates
         self._localEQSettings = State(initialValue: eqSettings)
     }
@@ -264,6 +273,9 @@ struct AppRow: View {
                     onOpenUI: onOpenAUUI,
                     onOpenGenericUI: onOpenAUGenericUI,
                     failedEntryIDs: auFailedEntryIDs,
+                    topologyDescriptions: auTopologyDescriptions,
+                    availableStereoPairs: auAvailableStereoPairs,
+                    onUpdateEntry: onUpdateAUEntry,
                     getFactoryPresets: getAUFactoryPresets,
                     onSelectFactoryPreset: onSelectAUFactoryPreset
                 )

@@ -18,6 +18,46 @@ enum AudioChannelRole: String, Codable, CaseIterable, Sendable {
     case rightRearSurround
     case mono
     case unknown
+
+    var displayLabel: String {
+        switch self {
+        case .left: return "Front Left"
+        case .right: return "Front Right"
+        case .centre: return "Centre"
+        case .lfe: return "LFE"
+        case .leftSurround: return "Side Left"
+        case .rightSurround: return "Side Right"
+        case .leftRearSurround: return "Rear Left"
+        case .rightRearSurround: return "Rear Right"
+        case .mono: return "Mono"
+        case .unknown: return "Unknown channel"
+        }
+    }
+}
+
+/// A user-selectable horizontal stereo pair.  The value is semantic on
+/// purpose: indices are resolved from the current stream layout and are never
+/// persisted as if they were stable channel identities.
+enum AUStereoPair: String, Codable, CaseIterable, Sendable {
+    case front
+    case side
+    case rear
+
+    var label: String {
+        switch self {
+        case .front: return "Front L/R"
+        case .side: return "Side L/R"
+        case .rear: return "Rear L/R"
+        }
+    }
+
+    var roles: (left: AudioChannelRole, right: AudioChannelRole) {
+        switch self {
+        case .front: return (.left, .right)
+        case .side: return (.leftSurround, .rightSurround)
+        case .rear: return (.leftRearSurround, .rightRearSurround)
+        }
+    }
 }
 
 enum AUProcessingMode: String, Codable, CaseIterable, Sendable {
@@ -25,7 +65,26 @@ enum AUProcessingMode: String, Codable, CaseIterable, Sendable {
     case nativeMultichannel
     case independentPerChannel
     case stereoOnly
+    case singleStereoPair
+    case linkedStereoPairs
     case bypassForLayout
+
+    static let userSelectableModes: [AUProcessingMode] = [
+        .auto, .nativeMultichannel, .singleStereoPair, .linkedStereoPairs,
+        .independentPerChannel, .bypassForLayout
+    ]
+
+    var displayLabel: String {
+        switch self {
+        case .auto: return "Auto"
+        case .nativeMultichannel: return "Native layout"
+        case .singleStereoPair: return "Single stereo pair"
+        case .linkedStereoPairs: return "Linked stereo pairs"
+        case .independentPerChannel: return "Independent mono"
+        case .stereoOnly: return "Stereo only"
+        case .bypassForLayout: return "Bypass on multichannel"
+        }
+    }
 }
 
 enum AUChannelSelection: String, Codable, CaseIterable, Sendable {
@@ -137,6 +196,36 @@ struct AudioStreamFormatDescription: Equatable, Sendable {
     }
 
     var isMultichannel: Bool { channelCount > 2 }
+
+    /// Resolves a semantic pair against this exact stream layout. Unknown
+    /// and duplicate roles are rejected; discrete channels are not guessed.
+    func stereoPairChannelIndices(for pair: AUStereoPair) -> (left: Int, right: Int)? {
+        let roles = pair.roles
+        guard channelRoles.count == channelCount,
+              let left = channelRoles.firstIndex(of: roles.left),
+              let right = channelRoles.firstIndex(of: roles.right),
+              left != right,
+              channelRoles.filter({ $0 == roles.left }).count == 1,
+              channelRoles.filter({ $0 == roles.right }).count == 1 else { return nil }
+        return (left, right)
+    }
+
+    var availableStereoPairs: [AUStereoPair] {
+        AUStereoPair.allCases.filter { stereoPairChannelIndices(for: $0) != nil }
+    }
+
+    var linkedStereoPairChannelIndices: [(pair: AUStereoPair, indices: (left: Int, right: Int))] {
+        availableStereoPairs.compactMap { pair in
+            guard let indices = stereoPairChannelIndices(for: pair) else { return nil }
+            return (pair, indices)
+        }
+    }
+
+    /// Backwards-compatible front-pair helper used by the original Phase A
+    /// implementation.
+    var frontStereoChannelIndices: (left: Int, right: Int)? {
+        stereoPairChannelIndices(for: .front)
+    }
 
     var shortLabel: String {
         switch channelCount {

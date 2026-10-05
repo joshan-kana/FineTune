@@ -16,6 +16,7 @@ final class AUPluginWindowManager {
     private var windows: [UUID: NSWindow] = [:]
     private var windowDelegates: [UUID: WindowDelegate] = [:]
     private var saveCallbacks: [UUID: () -> Void] = [:]
+    private var genericModes: [UUID: Bool] = [:]
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.joshankana.FineTune",
         category: "AUPluginWindow"
@@ -62,7 +63,26 @@ final class AUPluginWindowManager {
         windows[entryID] = window
         windowDelegates[entryID] = windowDelegate
         saveCallbacks[entryID] = onSave
+        genericModes[entryID] = forceGeneric
         logger.info("Opened AU window for \(pluginName)")
+    }
+
+    /// Rebinds an existing editor to the newly published render host while
+    /// preserving its frame, generic/custom choice, and save callback.
+    func rebindWindow(for entryID: UUID, audioUnit: AudioUnit, pluginName: String) {
+        guard let oldWindow = windows[entryID] else { return }
+        let frame = oldWindow.frame
+        let callback = saveCallbacks[entryID] ?? {}
+        let forceGeneric = genericModes[entryID] ?? false
+        closeWindow(for: entryID, save: false)
+        showWindow(
+            for: entryID,
+            audioUnit: audioUnit,
+            pluginName: pluginName,
+            forceGeneric: forceGeneric,
+            onSave: callback
+        )
+        windows[entryID]?.setFrame(frame, display: true)
     }
 
     func closeWindow(for entryID: UUID, save: Bool = true) {
@@ -82,6 +102,7 @@ final class AUPluginWindowManager {
         }
         windows.removeAll()
         windowDelegates.removeAll()
+        genericModes.removeAll()
     }
 
     func saveAllOpenWindows() {
@@ -95,6 +116,7 @@ final class AUPluginWindowManager {
         saveCallbacks.removeValue(forKey: entryID)
         windows.removeValue(forKey: entryID)
         windowDelegates.removeValue(forKey: entryID)
+        genericModes.removeValue(forKey: entryID)
     }
 
     // MARK: - View Loading
